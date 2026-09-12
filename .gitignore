@@ -1,5 +1,6 @@
 # 构建中间产物（本地生成，不入库）
 Alltear_UnrealMemoryToolsNewMcp/build/
+Alltear_UnrealMemoryToolsNewMcp/build-termux/
 
 # 编译产物（adb push 用，不入库）
 Alltear_UnrealMemoryToolsNewMcp/outputs/

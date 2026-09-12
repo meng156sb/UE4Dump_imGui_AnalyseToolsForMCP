@@ -9,6 +9,8 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_SYSTEM_VERSION 30)
 set(ANDROID_PLATFORM 30)
 set(ANDROID_ABI arm64-v8a)
+# Match the release ELF (no libc++_shared.so). Must be set before project().
+set(ANDROID_STL c++_static)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/outputs/${ANDROID_ABI})
 project(UnrealMemoryTools)
 
@@ -59,9 +61,6 @@ endif()
 link_libraries(-llog -landroid -lEGL -lGLESv3 -lvulkan -lz -ldl)
 
 add_executable(UnrealMemoryTools ${UE_SRC} ${UE_PROFILE_SRC} ${AUTOFIX_SRC} ${MCP_SRC} ${MCP_ANALYSIS_SRC} ${GUI_SRC} src/executable.cpp src/Dumper.cpp src/UPackageGenerator.cpp src/SDKExplorer.cpp ${KITTYMEMORY_SRC} ${DEPS_PATH}/fmt/format.cc
-        src/AutoFix/NativeFunctionResolver.cpp
-        src/AutoFix/PropertyOffsetFinder.cpp
-        src/AutoFix/StructLayout.cpp
         src/Utils/BufferFmt.cpp
         src/Utils/KittyCmdln.cpp
         src/Utils/ProgressUtils.cpp)

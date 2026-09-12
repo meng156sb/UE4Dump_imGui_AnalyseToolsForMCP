@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <android/native_window.h>
 #include "AndroidImgui.h"
 #include "imgui.h"
@@ -10,7 +11,12 @@ bool AndroidImgui::Init_Render(ANativeWindow *window, float width, float height)
     m_Height = height;
 
     ANativeWindow_acquire(window);
-    Create();
+    if (!Create()) {
+        fprintf(stderr, "[graphics] Create() failed for %s\n", RenderName);
+        ANativeWindow_release(window);
+        m_Window = nullptr;
+        return false;
+    }
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();

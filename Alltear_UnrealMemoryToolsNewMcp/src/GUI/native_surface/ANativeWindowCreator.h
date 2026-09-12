@@ -229,6 +229,8 @@ namespace android {
             StrongPointer<void> (*SurfaceComposerClient__CreateSurface_and8)(void *thiz, void *name, uint32_t w, uint32_t h, int32_t format, uint32_t flags, void *parentHandle, uint32_t windowType, uint32_t ownerUid) = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__CreateSurface_and9)(void *thiz, void *name, uint32_t w, uint32_t h, int32_t format, uint32_t flags, void *parentHandle, int32_t windowType, int32_t ownerUid) = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__MirrorSurface)(void *thiz, void *mirrorFromSurface) = nullptr;
+            // Android 16 / some OEM builds only export the two-arg overload.
+            StrongPointer<void> (*SurfaceComposerClient__MirrorSurfaceWithParent)(void *thiz, void *mirrorFromSurface, void *parent) = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__GetInternalDisplayToken)() = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__GetBuiltInDisplay)(ui::DisplayType type) = nullptr;
             int32_t (*SurfaceComposerClient__GetDisplayState)(StrongPointer<void> &display, ui::DisplayState *displayState) = nullptr;
@@ -292,6 +294,7 @@ namespace android {
                     ResolveMethod(LayerMetadata, setInt32, libgui, "_ZN7android13LayerMetadata8setInt32Eji");
                 } else if (14 <= systemVersion) {
                     ResolveMethod(LayerMetadata, Constructor, libgui, "_ZN7android3gui13LayerMetadataC2Ev");
+                    ResolveMethod(LayerMetadata, setInt32, libgui, "_ZN7android3gui13LayerMetadata8setInt32Eji");
                 }
 
                 ResolveMethod(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
@@ -320,9 +323,13 @@ namespace android {
                     ResolveMethod(SurfaceComposerClient, CreateSurface, libgui, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj");
                 }
                 
-                // MirrorSurface method - Android 11+
+                // MirrorSurface method - Android 11+. Android 16 / ColorOS dropped the
+                // one-arg symbol and only exports mirrorSurface(SurfaceControl*, SurfaceControl*).
                 if (11 <= systemVersion) {
                     ResolveMethod(SurfaceComposerClient, MirrorSurface, libgui, "_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE");
+                    if (nullptr == SurfaceComposerClient__MirrorSurface) {
+                        ResolveMethod(SurfaceComposerClient, MirrorSurfaceWithParent, libgui, "_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlES2_");
+                    }
                 }
                 
                 // Display related methods - version specific selection
@@ -462,12 +469,16 @@ namespace android {
 
             LayerMetadata() {
                 if (9 < Functionals::GetInstance().systemVersion) {
-                    Functionals::GetInstance().LayerMetadata__Constructor(data);
+                    auto ctor = Functionals::GetInstance().LayerMetadata__Constructor;
+                    if (ctor)
+                        ctor(data);
                 }
             }
-            
+
             void setInt32(uint32_t key, int32_t value) {
-                Functionals::GetInstance().LayerMetadata__setInt32(data, key, value);            
+                auto fn = Functionals::GetInstance().LayerMetadata__setInt32;
+                if (fn)
+                    fn(data, key, value);
             }
             
             operator void *() {
@@ -531,46 +542,62 @@ namespace android {
             char data[1024];
 
             SurfaceComposerClientTransaction() {
-                Functionals::GetInstance().SurfaceComposerClient__Transaction__Constructor(data);
+                auto ctor = Functionals::GetInstance().SurfaceComposerClient__Transaction__Constructor;
+                if (ctor)
+                    ctor(data);
             }
 
             void *SetLayer(StrongPointer<void> &surfaceControl, int32_t z) {
-                return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayer(data, surfaceControl, z);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayer;
+                return fn ? fn(data, surfaceControl, z) : nullptr;
             }
 
             void *SetTrustedOverlay(StrongPointer<void> &surfaceControl, bool isTrustedOverlay) {
-                return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetTrustedOverlay(data, surfaceControl, isTrustedOverlay);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetTrustedOverlay;
+                return fn ? fn(data, surfaceControl, isTrustedOverlay) : nullptr;
             }
 
             void *SetLayerStack(StrongPointer<void> &surfaceControl, uint32_t layerStack) {
-                return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayerStack(data, surfaceControl, layerStack);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayerStack;
+                return fn ? fn(data, surfaceControl, layerStack) : nullptr;
             }
 
             void Show(StrongPointer<void> &surfaceControl) {
-                Functionals::GetInstance().SurfaceComposerClient__Transaction__Show(data, surfaceControl);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__Show;
+                if (fn)
+                    fn(data, surfaceControl);
             }
 
             void Hide(StrongPointer<void> &surfaceControl) {
-                Functionals::GetInstance().SurfaceComposerClient__Transaction__Hide(data, surfaceControl);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__Hide;
+                if (fn)
+                    fn(data, surfaceControl);
             }
 
             void Reparent(StrongPointer<void> &surfaceControl, StrongPointer<void> &newParentHandle) {
-                Functionals::GetInstance().SurfaceComposerClient__Transaction__Reparent(data, surfaceControl, newParentHandle);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__Reparent;
+                if (fn)
+                    fn(data, surfaceControl, newParentHandle);
             }
 
             void *SetMatrix(StrongPointer<void> &surfaceControl, float dsdx, float dtdx, float dtdy, float dsdy) {
-                return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetMatrix(data, surfaceControl, dsdx, dtdx, dtdy, dsdy);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetMatrix;
+                return fn ? fn(data, surfaceControl, dsdx, dtdx, dtdy, dsdy) : nullptr;
             }
 
             void SetPosition(StrongPointer<void> &surfaceControl, float x, float y) {
-                Functionals::GetInstance().SurfaceComposerClient__Transaction__SetPosition(data, surfaceControl, x, y);
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetPosition;
+                if (fn)
+                    fn(data, surfaceControl, x, y);
             }
 
             int32_t Apply(bool synchronous, bool oneWay) {
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__Apply;
+                if (!fn)
+                    return -1;
                 if (12 >= Functionals::GetInstance().systemVersion)
-                    return reinterpret_cast<int32_t (*)(void *, bool)>(Functionals::GetInstance().SurfaceComposerClient__Transaction__Apply)(data, synchronous);
-                else
-                    return Functionals::GetInstance().SurfaceComposerClient__Transaction__Apply(data, synchronous, oneWay);
+                    return reinterpret_cast<int32_t (*)(void *, bool)>(fn)(data, synchronous);
+                return fn(data, synchronous, oneWay);
             }
         };
 
@@ -750,7 +777,16 @@ namespace android {
                     return {};
                 }
 
-                auto mirrorSurface = Functionals::GetInstance().SurfaceComposerClient__MirrorSurface(data, surface.data);
+                StrongPointer<void> mirrorSurface{};
+                if (Functionals::GetInstance().SurfaceComposerClient__MirrorSurface) {
+                    mirrorSurface = Functionals::GetInstance().SurfaceComposerClient__MirrorSurface(data, surface.data);
+                } else if (Functionals::GetInstance().SurfaceComposerClient__MirrorSurfaceWithParent) {
+                    // OEM Android 16: parent may be null for a top-level mirror.
+                    mirrorSurface = Functionals::GetInstance().SurfaceComposerClient__MirrorSurfaceWithParent(data, surface.data, nullptr);
+                } else {
+                    SURFACE_LOG_ERROR("mirrorSurface symbol is unavailable; skipping extra-display mirror");
+                    return {};
+                }
                 if (nullptr == mirrorSurface.get()) {
                     return {};
                 }
@@ -1041,6 +1077,10 @@ namespace android {
             static std::chrono::steady_clock::time_point lastTime{};
 
             if (13 > detail::Functionals::GetInstance().systemVersion)
+                return;
+
+            if (!detail::Functionals::GetInstance().SurfaceComposerClient__MirrorSurface &&
+                !detail::Functionals::GetInstance().SurfaceComposerClient__MirrorSurfaceWithParent)
                 return;
 
             if (std::chrono::steady_clock::now() - lastTime < std::chrono::seconds(1))

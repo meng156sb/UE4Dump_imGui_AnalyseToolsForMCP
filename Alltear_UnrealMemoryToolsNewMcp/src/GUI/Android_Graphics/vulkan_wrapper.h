@@ -28,6 +28,8 @@ extern "C" {
  */
 
 int InitVulkan(void);
+void ReloadVulkanInstanceProcs(VkInstance instance);
+void ReloadVulkanDeviceProcs(VkDevice device);
 
 
 // VK_core

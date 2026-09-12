@@ -217,6 +217,48 @@ int InitVulkan(void) {
     return 1;
 }
 
+#define UMT_VK_RELOAD(dst, src) do { \
+    PFN_vkVoidFunction _p = (src); \
+    if (_p) \
+        (dst) = reinterpret_cast<decltype(dst)>(_p); \
+} while (0)
+
+void ReloadVulkanInstanceProcs(VkInstance instance) {
+    if (!instance || !vkGetInstanceProcAddr)
+        return;
+    UMT_VK_RELOAD(vkDestroySurfaceKHR, vkGetInstanceProcAddr(instance, "vkDestroySurfaceKHR"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceSurfaceSupportKHR, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceSurfaceCapabilitiesKHR, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceSurfaceFormatsKHR, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceSurfacePresentModesKHR, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+    UMT_VK_RELOAD(vkCreateAndroidSurfaceKHR, vkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR"));
+#endif
+    UMT_VK_RELOAD(vkGetDeviceProcAddr, vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
+    UMT_VK_RELOAD(vkCreateDevice, vkGetInstanceProcAddr(instance, "vkCreateDevice"));
+    UMT_VK_RELOAD(vkEnumeratePhysicalDevices, vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceQueueFamilyProperties, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceProperties, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
+    UMT_VK_RELOAD(vkGetPhysicalDeviceMemoryProperties, vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties"));
+    UMT_VK_RELOAD(vkEnumerateDeviceExtensionProperties, vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties"));
+}
+
+void ReloadVulkanDeviceProcs(VkDevice device) {
+    if (!device || !vkGetDeviceProcAddr)
+        return;
+    UMT_VK_RELOAD(vkCreateSwapchainKHR, vkGetDeviceProcAddr(device, "vkCreateSwapchainKHR"));
+    UMT_VK_RELOAD(vkDestroySwapchainKHR, vkGetDeviceProcAddr(device, "vkDestroySwapchainKHR"));
+    UMT_VK_RELOAD(vkGetSwapchainImagesKHR, vkGetDeviceProcAddr(device, "vkGetSwapchainImagesKHR"));
+    UMT_VK_RELOAD(vkAcquireNextImageKHR, vkGetDeviceProcAddr(device, "vkAcquireNextImageKHR"));
+    UMT_VK_RELOAD(vkQueuePresentKHR, vkGetDeviceProcAddr(device, "vkQueuePresentKHR"));
+    UMT_VK_RELOAD(vkDestroyDevice, vkGetDeviceProcAddr(device, "vkDestroyDevice"));
+    UMT_VK_RELOAD(vkGetDeviceQueue, vkGetDeviceProcAddr(device, "vkGetDeviceQueue"));
+    UMT_VK_RELOAD(vkDeviceWaitIdle, vkGetDeviceProcAddr(device, "vkDeviceWaitIdle"));
+    UMT_VK_RELOAD(vkQueueSubmit, vkGetDeviceProcAddr(device, "vkQueueSubmit"));
+    UMT_VK_RELOAD(vkCreateDescriptorPool, vkGetDeviceProcAddr(device, "vkCreateDescriptorPool"));
+    UMT_VK_RELOAD(vkDestroyDescriptorPool, vkGetDeviceProcAddr(device, "vkDestroyDescriptorPool"));
+}
+
 // No Vulkan support, do not set function addresses
 PFN_vkCreateInstance vkCreateInstance;
 PFN_vkDestroyInstance vkDestroyInstance;
