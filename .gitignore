@@ -28,3 +28,6 @@ build/
 
 # 本地 dump 校验产物（数十 MB，不入库）
 _dump_verify/
+
+# clangd 用：指向 build/ 下 CMake 生成的编译数据库（build/ 本身已 ignore）
+Alltear_UnrealMemoryToolsNewMcp/compile_commands.json

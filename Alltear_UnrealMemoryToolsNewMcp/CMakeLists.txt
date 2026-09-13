@@ -12,6 +12,10 @@ set(ANDROID_ABI arm64-v8a)
 # Match the release ELF (no libc++_shared.so). Must be set before project().
 set(ANDROID_STL c++_static)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/outputs/${ANDROID_ABI})
+# 导出 compile_commands.json：clangd / IDE 靠它拿到全部 -I 与宏定义。
+# 不开的话编辑器只能用编译器的默认搜索路径，于是 deps/ 下的 nlohmann/json.hpp、
+# KittyMemoryMgr.hpp 等一律报 "file not found"，满屏假错误（实际 ninja 构建是好的）。
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project(UnrealMemoryTools)
 
 option(UMT_GHIDRA "Enable ghidra-native ARM64 decompiler" ON)
