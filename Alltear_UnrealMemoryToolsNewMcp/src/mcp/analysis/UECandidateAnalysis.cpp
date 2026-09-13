@@ -943,9 +943,12 @@ json SampleGNamesCandidate(const json &args, const KittyMemoryMgr &mgr)
     std::lock_guard<std::mutex> lock(gCandidateMutex);
     const NameCandidate &candidate = GetNameCandidate(sessionId, candidateId, snapshot.pid,
                                                        snapshot.processStartTime);
-    if (!IsReadableAddress(snapshot, candidate.poolAddress,
-                           candidate.layout.blocksOff + sizeof(uintptr_t)))
-        throw HandlerError(Err::kMapStale, "names candidate 的 FNamePool 已不可读");
+    // 必须与扫描侧同一个判据：池子可能落在 -w-p 的 [anon:.bss]（内核 perms 无 r），
+    // 扫描用 IsAccessibleAddress 把它选出来，这里若用 IsReadableAddress 就会把刚选出的
+    // 候选判死（实测 DFM：扫出 poolAddress=0x74124f4ec0 后 sample 直接 E_MAP_STALE）。
+    if (!IsAccessibleAddress(snapshot, candidate.poolAddress,
+                             candidate.layout.blocksOff + sizeof(uintptr_t)))
+        throw HandlerError(Err::kMapStale, "names candidate 的 FNamePool 已不可访问");
     const NameDecode mode = ParseNameDecode(args.value("decode", "auto"));
     // walk 默认 true：沿条目链走（见 NameEntryStep 的说明）。传 false 退回按 id 自增，
     // 用来对照「某个 id 是不是刚好踩在条目边界上」——稠密模式下大量 valid=false 就说明
@@ -1079,7 +1082,7 @@ json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std
                     std::memcpy(&objects, buffer.data() + objectsPos, sizeof(objects));
                     std::memcpy(&count, buffer.data() + countPos, sizeof(count));
                     if (count < 1024 || count > 5000000 ||
-                        !IsReadableAddress(snapshot, objects, sizeof(uintptr_t)))
+                        !IsAccessibleAddress(snapshot, objects, sizeof(uintptr_t)))
                         continue;
                     std::ostringstream key;
                     key << std::hex << address << ':' << layout.objObjectsOff << ':' << layout.objectsOff
@@ -1149,7 +1152,7 @@ json SampleObjectCandidate(const json &args, const KittyMemoryMgr &mgr)
         uintptr_t object = 0, klass = 0, outer = 0;
         int32_t nameId = -1;
         const bool gotObject = ReadObjectAt(mgr, candidate, index, object);
-        bool valid = gotObject && IsReadableAddress(snapshot, object, 8);
+        bool valid = gotObject && IsAccessibleAddress(snapshot, object, 8);
         if (valid)
         {
             ReadValue(mgr, object + candidate.layout.classPrivateOff, klass);
