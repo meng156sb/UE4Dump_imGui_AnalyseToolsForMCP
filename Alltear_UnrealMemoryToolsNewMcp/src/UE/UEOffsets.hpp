@@ -208,6 +208,16 @@ struct UE_Pointers
     uintptr_t NativeAndroidApp = 0;
     uintptr_t ProcessEvent = 0;
     uintptr_t ProcessEventIdx = 0;
+
+    // Engine / World 是否来自 profile 的模块相对偏移（GetGEngineSlot / GetGWorldSlot）。
+    // 构造函数 memset 归零，所以默认 false = 「未校验」，这是安全的一侧：
+    // 不显式置 true 就绝不会被当成可信值输出。见 Dumper.cpp 里置位处与 ToString 的输出。
+    bool EngineVerified = false;
+    bool WorldVerified = false;
+    // 同上的道理。NativeAndroidApp 的基类实现是结构搜索（见 IGameProfile），
+    // 目前没有任何 profile 声明过它的 RVA，所以默认 false。
+    bool NativeAndroidAppVerified = false;
+
     std::string ToString() const;
 };
 
@@ -283,6 +293,10 @@ protected:
     uintptr_t StaticFindObject;
     uintptr_t NativeAndroidApp;
     uintptr_t ProcessEvent;
+    // NativeAndroidApp 是否来自 profile 声明的模块偏移（而非基类的结构搜索）。
+    // 放在 UEVars 而不是 UE_Pointers：置位需要访问 IGameProfile 的 protected 方法，
+    // 而 UEVars 正是 profile 内部填值的地方（见 IGameProfile::InitUEVars）。
+    bool NativeAndroidAppVerified = false;
     UE_Offsets *Offsets;
 
     std::function<std::string(int32_t)> pGetNameByID;
@@ -306,6 +320,7 @@ public:
     uintptr_t GetFrameCount() const { return FrameCount; };
     uintptr_t GetStaticFindObject() const { return StaticFindObject; };
     uintptr_t GetNativeAndroidApp() const { return NativeAndroidApp; };
+    bool IsNativeAndroidAppVerified() const { return NativeAndroidAppVerified; };
     uintptr_t GetProcessEvent() const { return ProcessEvent; };
     UE_Offsets *GetOffsets() const { return Offsets; };
 

@@ -86,6 +86,35 @@ bool KittyMemSys::init(pid_t pid)
     return true;
 }
 
+// process_vm_readv refuses any VMA that lacks VM_READ, failing the whole iovec
+// with EFAULT. Android builds with a PROT_WRITE-only "-w-p" [anon:.bss] window
+// hit this: the window is deliberately unreadable to mprotect/read-style access
+// yet the kernel still serves it through /proc/<pid>/mem. Delta Force CN keeps
+// FNamePool / GUObjectArray / GWorld / GEngine inside exactly such a window, so
+// every syscall read of them returned 0 and the probe died in
+// ERROR_INIT_GUOBJECTARRAY while the same addresses read back fine by hand.
+// Fall back to the IO path for those chunks instead of discarding the request.
+size_t KittyMemSys::readViaFallback(uintptr_t address, void *buffer, size_t len) const
+{
+    if (!_pFallbackMem && !_fallbackUnavailable)
+    {
+        char memPath[256] = {0};
+        snprintf(memPath, sizeof(memPath), "/proc/%d/mem", _pid);
+
+        auto mem = std::make_unique<KittyIOFile>(memPath, O_RDWR);
+        if (mem->Open())
+            _pFallbackMem = std::move(mem);
+        else
+            _fallbackUnavailable = true;
+    }
+
+    if (!_pFallbackMem)
+        return 0;
+
+    const ssize_t bytes = _pFallbackMem->Read(address, buffer, len);
+    return bytes > 0 ? size_t(bytes) : 0;
+}
+
 size_t KittyMemSys::Read(uintptr_t address, void *buffer, size_t len) const
 {
     if (_pid < 1 || !address || !buffer || !len)
@@ -107,6 +136,8 @@ size_t KittyMemSys::Read(uintptr_t address, void *buffer, size_t len) const
 
         errno = 0;
         n = KT_EINTR_RETRY(call_process_vm_readv(_pid, &lvec, 1, &rvec, 1, 0));
+        // Captured before any fallback read, which would overwrite errno.
+        const int err = n == -1 ? errno : 0;
         if (n > 0)
         {
             remaining -= n;
@@ -116,9 +147,24 @@ size_t KittyMemSys::Read(uintptr_t address, void *buffer, size_t len) const
         }
         else
         {
+            if (err == EFAULT && remaining_or_pglen)
+            {
+                const size_t got = readViaFallback(uintptr_t(rvec.iov_base), lvec.iov_base, remaining_or_pglen);
+                if (got)
+                {
+                    remaining -= got;
+                    bytes_read += got;
+                    lvec.iov_base = reinterpret_cast<char*>(lvec.iov_base) + got;
+                    rvec.iov_base = reinterpret_cast<char*>(rvec.iov_base) + got;
+                    // A short read means the next byte boundary is unreadable; step
+                    // one page at a time from here, as the failing path does.
+                    read_one_page = got != remaining_or_pglen;
+                    continue;
+                }
+            }
+
             if (n == -1)
             {
-                int err = errno;
                 switch (err)
                 {
                 case EPERM:

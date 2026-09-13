@@ -2092,12 +2092,30 @@ namespace
                 bool casePreserving = gProbeResult.profile->isUsingCasePreservingName();
                 json samples = json::array();
                 bool anyValid = false;
-                for (int32_t i = 0; i < 16; ++i)
+                // 按条目链前进，不要按 id 自增：FNamePool 的真实 id 是「条目字节偏移 / Stride」，
+                // 条目首尾相接（2 字节 header + len 字节正文），相邻真实 id 的间隔等于条目字节数 /
+                // Stride，通常是 3、4、9 这种，不是 1。按 i++ 采样绝大多数 id 会落进条目正文中间，
+                // 读出一个把后续若干条目拼在一起的长串（条目边界那 2 字节 header 被当成正文），
+                // 于是显示成一串 "??"。链式前进才拿得到完整名字。
+                int32_t curId = 0;
+                for (int32_t n = 0; n < 16; ++n)
                 {
-                    std::string nm = UEWrappers::GetNameByID(i);
-                    bool valid = !nm.empty() && nm.find('\0') == std::string::npos;
+                    std::string nm = UEWrappers::GetNameByID(curId);
+                    size_t declaredLen = 0;
+                    int32_t nextId = -1;
+                    bool wide = false;
+                    const bool meta = gProbeResult.profile->GetNameEntryMeta(
+                        curId, declaredLen, nextId, wide);
+                    // 只有「解出的长度 == header 声明的长度」才是踩在条目边界上的证据；
+                    // 以前只判非空 + 无 NUL，导致拼出来的垃圾也报 valid=true，自校验形同虚设。
+                    bool valid = !nm.empty() && nm.find('\0') == std::string::npos &&
+                                 meta && !wide && nm.size() == declaredLen;
+                    for (unsigned char c : nm)
+                        if (c < 0x20 || c == 0x7F) { valid = false; break; }
                     if (valid) anyValid = true;
-                    samples.push_back({{"index", i}, {"name", nm}, {"valid", valid}});
+                    samples.push_back({{"index", curId}, {"name", nm}, {"valid", valid}});
+                    if (nextId <= curId) break;
+                    curId = nextId;
                 }
                 return {{"namesPtr", UmtMcp::FormatAddress(namesPtr)},
                         {"layout", useFNamePool ? "FNamePool" : "FNameEntryArray"},
@@ -2123,14 +2141,35 @@ namespace
                     throw UmtMcp::HandlerError(UmtMcp::Err::kBadArgs, "startIndex 须 >= 0");
                 if (count < 1 || count > 2000)
                     throw UmtMcp::HandlerError(UmtMcp::Err::kBadArgs, "count 须在 [1, 2000]");
+                // 默认沿条目链前进（见 SCAN_GNAMES 的说明：FNamePool 的 id 不稠密，按 i++ 会落进
+                // 条目中间拼出 "??" 垃圾）。传 walk=false 可退回旧的稠密自增，用于对照
+                // 「某个 id 是否真的是条目边界」——稠密模式下 valid 大面积 false 就说明 id 不稠密。
+                const bool walk = args.value("walk", true);
                 json samples = json::array();
-                for (int32_t i = startIndex; i < startIndex + count; ++i)
+                int32_t curId = startIndex;
+                for (int32_t n = 0; n < count; ++n)
                 {
-                    std::string nm = UEWrappers::GetNameByID(i);
-                    bool valid = !nm.empty() && nm.find('\0') == std::string::npos;
-                    samples.push_back({{"index", i}, {"name", nm}, {"valid", valid}});
+                    std::string nm = UEWrappers::GetNameByID(curId);
+                    size_t declaredLen = 0;
+                    int32_t nextId = -1;
+                    bool wide = false;
+                    const bool meta = gProbeResult.profile->GetNameEntryMeta(
+                        curId, declaredLen, nextId, wide);
+                    // 宽字符名走 UTF-8，字节数 ≠ header 字符数，不能再拿 nm.size()==declaredLen
+                    // 卡掉；!wide 那条会把所有 CJK 名标成 invalid，候选扫描对照时看起来像没解。
+                    bool valid = !nm.empty() && nm.find('\0') == std::string::npos && meta;
+                    if (valid && !wide)
+                        valid = nm.size() == declaredLen;
+                    for (unsigned char c : nm)
+                        if (c < 0x20 || c == 0x7F) { valid = false; break; }
+                    samples.push_back({{"index", curId}, {"name", nm},
+                                       {"valid", valid}, {"wide", wide},
+                                       {"declaredLen", declaredLen}});
+                    if (!walk) { ++curId; continue; }
+                    if (nextId <= curId) break;  // 走不动了（非条目边界或池子末尾）
+                    curId = nextId;
                 }
-                return {{"startIndex", startIndex}, {"count", count}, {"samples", samples}};
+                return {{"startIndex", startIndex}, {"count", count}, {"walk", walk}, {"samples", samples}};
             }, true);
 
         // ── SCAN_OBJECTS（G 组：定位 GUObjectArray 候选并自校验）
@@ -2800,6 +2839,30 @@ namespace
                 std::string worldSource = "PROBE_OVERRIDE";
                 if (!gWorldSlot)
                 {
+                    // Delta Force (CN) build hint. The generic OBJECT_REFERENCE scan
+                    // below cannot find this slot on its own: the globals live in a
+                    // "-w-p" [anon:.bss] window whose only module slot is reachable
+                    // through ElfScanner::segments(), and the module-relative address
+                    // is stable across ASLR bases on this build. The validation chain
+                    // further down still has to prove slot + object + class, so this
+                    // only proposes a candidate, it does not assert one.
+                    const bool deltaForceCn = gSelectedIndex >= 0 &&
+                        gSelectedIndex < static_cast<int>(gCandidates.size()) &&
+                        gCandidates[gSelectedIndex].package == "com.tencent.tmgp.dfm";
+                    if (deltaForceCn && elf.isValid())
+                    {
+                        constexpr uintptr_t kDeltaForceCnGWorldOffset = 0x1FE10148;
+                        const uintptr_t hintedSlot = elf.base() + kDeltaForceCnGWorldOffset;
+                        if (UmtMcp::Analysis::IsReadableAddress(snapshot, hintedSlot, sizeof(uintptr_t)))
+                        {
+                            gWorldSlot = hintedSlot;
+                            worldSource = "DELTAFORCE_CN_OFFSET";
+                            evidence.push_back("GWorld slot from verified Delta Force (CN) relative offset");
+                        }
+                    }
+                }
+                if (!gWorldSlot)
+                {
                     // Verified Shikigami UE4.27 build hint; validate slot/object below.
                     const bool shikigami = gSelectedIndex >= 0 &&
                         gSelectedIndex < static_cast<int>(gCandidates.size()) &&
@@ -2834,7 +2897,10 @@ namespace
                                 !object.IsA(worldClass)) return false;
                             for (auto it = segments.rbegin(); it != segments.rend(); ++it)
                             {
-                                if (!it->is_rw) continue;
+                                // `writeable` is (perms[1]=='w') and so includes the
+                                // "-w-p" [anon:.bss] window; `is_rw` is a strict "rw-"
+                                // match that skipped exactly that segment.
+                                if (!it->writeable) continue;
                                 const uintptr_t slot = UEMemory::FindAlignedPointerRefrence(
                                     it->startAddress, it->length, object.GetAddress());
                                 if (!slot) continue;
@@ -3413,7 +3479,7 @@ namespace
                                 "候选绑定需要 sessionId + candidateId，且仅支持 names/objects");
                         std::string reason;
                         if (!UmtMcp::Analysis::ValidateCandidateBinding(key, sessionId, candidateId,
-                                currentPid, snapshot.processStartTime, currentRevision, addr, reason))
+                                currentPid, snapshot.processStartTime, addr, reason))
                             throw UmtMcp::HandlerError(UmtMcp::Err::kSessionStale,
                                 "override 候选证据校验失败: " + reason);
                     }

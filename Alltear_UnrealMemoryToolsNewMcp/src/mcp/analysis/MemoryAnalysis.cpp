@@ -186,10 +186,22 @@ uintptr_t ModuleBaseFor(const MapSnapshot &snapshot, const KittyMemoryEx::ProcMa
     return base == std::numeric_limits<uintptr_t>::max() ? 0 : base;
 }
 
+// 二分而非线性：/proc/pid/maps 天然按地址升序，getAllMaps 顺序读入不做重排，
+// 所以 snapshot.maps 恒为升序。这个查找在候选扫描的热循环里对**每个 8 字节槽**
+// 都要过一次，线性扫 5851 个映射会退化成十亿级比较——加了锚点门禁（不再靠
+// maxCandidates 提前退出）之后必然把扫描拖到心跳超时。
 const KittyMemoryEx::ProcMap *FindMap(const MapSnapshot &snapshot, uintptr_t address)
 {
-    for (const auto &map : snapshot.maps)
-        if (map.contains(address)) return &map;
+    const auto &maps = snapshot.maps;
+    size_t lo = 0, hi = maps.size();
+    while (lo < hi)
+    {
+        const size_t mid = lo + (hi - lo) / 2;
+        const KittyMemoryEx::ProcMap &m = maps[mid];
+        if (address < m.startAddress) hi = mid;
+        else if (address >= m.endAddress) lo = mid + 1;
+        else return &m;
+    }
     return nullptr;
 }
 
@@ -601,24 +613,30 @@ std::string CurrentMapRevision(const KittyMemoryMgr &mgr)
     return CaptureMaps(mgr).revision;
 }
 
+namespace
+{
+} // namespace
+
 bool IsReadableAddress(const MapSnapshot &snapshot, uintptr_t address, size_t size)
 {
     if (size == 0) return false;
-    for (const auto &map : snapshot.maps)
-        if (map.readable && address >= map.startAddress && address < map.endAddress &&
-            size <= map.endAddress - address)
-            return true;
-    return false;
+    const KittyMemoryEx::ProcMap *map = FindMap(snapshot, address);
+    return map && map->readable && size <= map->endAddress - address;
 }
 
 bool IsWritableAddress(const MapSnapshot &snapshot, uintptr_t address, size_t size)
 {
     if (size == 0) return false;
-    for (const auto &map : snapshot.maps)
-        if (map.writeable && address >= map.startAddress && address < map.endAddress &&
-            size <= map.endAddress - address)
-            return true;
-    return false;
+    const KittyMemoryEx::ProcMap *map = FindMap(snapshot, address);
+    return map && map->writeable && size <= map->endAddress - address;
+}
+
+bool IsAccessibleAddress(const MapSnapshot &snapshot, uintptr_t address, size_t size)
+{
+    // 见头文件说明：读路径对 EFAULT 有 pread 回退，所以 -w-p 窗口也算可访问。
+    if (size == 0) return false;
+    const KittyMemoryEx::ProcMap *map = FindMap(snapshot, address);
+    return map && (map->readable || map->writeable) && size <= map->endAddress - address;
 }
 
 ElfScanner FindUnrealElf(const KittyMemoryMgr &mgr, const std::string &moduleHint)

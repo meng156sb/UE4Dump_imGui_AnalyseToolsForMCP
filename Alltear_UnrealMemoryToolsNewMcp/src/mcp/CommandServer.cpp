@@ -97,6 +97,10 @@ bool CommandServer::Start(uint16_t port, CommandQueue *queue, const std::string 
     if (!queue)
         return false;
 
+    // 兜底：SendAll 已用 MSG_NOSIGNAL，这里再把 SIGPIPE 全局忽略，避免将来新增的
+    // 任何写路径（日志管道、其它 socket）在客户端断开时把整个服务端带走。
+    ::signal(SIGPIPE, SIG_IGN);
+
     queue_ = queue;
     port_ = port;
     if (!buildVersion.empty())
@@ -132,7 +136,11 @@ bool CommandServer::SendAll(int sock, const char *data, size_t len)
     size_t sent = 0;
     while (sent < len)
     {
-        ssize_t n = ::send(sock, data + sent, len - sent, 0);
+        // MSG_NOSIGNAL 必须带：客户端在长命令执行期间超时断开是常态（心跳阈值
+        // 10s，而一次全量扫描可以跑几十秒），此时写回已关闭的 socket 会触发
+        // SIGPIPE，默认动作直接终止整个服务端进程——表现为设备端"假死"后再也连不上。
+        // 带了这个标志就只返回 -1/EPIPE，由调用方关连接继续服务。
+        ssize_t n = ::send(sock, data + sent, len - sent, MSG_NOSIGNAL);
         if (n <= 0)
         {
             if (errno == EINTR)

@@ -15,6 +15,7 @@
 #include "MemoryAnalysis.hpp"
 #include "../MemoryHelpers.hpp"
 #include "../Protocol.hpp"
+#include "../../Utils/NameCipher.hpp"
 
 namespace UmtMcp::Analysis
 {
@@ -42,6 +43,9 @@ struct NameCandidate
     uintptr_t block0 = 0;
     NameLayout layout;
     int score = 0;
+    // 命中的锚点名个数。分数不足以区分真池和「指针密集段」的垃圾（见扫描处的说明），
+    // 这个字段才是判据：真池必然在某个偏移解出 None/ByteProperty 等锚点名。
+    int anchorHits = 0;
     json evidence = json::array();
     json failedChecks = json::array();
 };
@@ -123,9 +127,65 @@ bool ReadValue(const KittyMemoryMgr &mgr, uintptr_t address, T &value)
 
 bool IsPrintableName(const std::string &name)
 {
-    if (name.empty() || name.size() > 127) return false;
+    // 127 是 header 里的字符数上限；UTF-8 CJK 每字 3 字节，所以按字节放宽到 127*3。
+    if (name.empty() || name.size() > 127 * 3) return false;
     for (unsigned char c : name)
         if (c < 0x20 || c == 0x7F) return false;
+    return true;
+}
+
+// 比 IsPrintableName 严：要求整串都落在 ASCII 可见区 [0x20,0x7E]。
+// 用途是区分「明文名字」和「异或过的名字」——密文里出现 >=0x80 的字节很正常（实测
+// None 的密文是 b1 90 91 9a），所以只要限制在 <0x80 就能把两者分开。只给 ANSI 路径的
+// Auto 启发式用；宽字符走 IsPlausibleFName。
+bool IsPlainAsciiName(const std::string &name)
+{
+    if (name.empty() || name.size() > 127) return false;
+    for (unsigned char c : name)
+        if (c < 0x20 || c > 0x7E) return false;
+    return true;
+}
+
+// 宽字符 Auto 启发式：解出的每个码点都得落在 FName 实际会用的区间。错密钥解宽字符
+// 不会出非法字节，会出合法 UTF-8 乱码（西里尔/IPA/生僻汉字），IsPrintableName 放它过。
+bool IsPlausibleFName(const std::string &name)
+{
+    if (name.empty() || name.size() > 127 * 3) return false;
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(name.data());
+    const unsigned char *end = p + name.size();
+    while (p < end)
+    {
+        uint32_t cp = 0;
+        if (*p < 0x80)
+        {
+            cp = *p++;
+        }
+        else if ((*p & 0xE0) == 0xC0 && p + 1 < end)
+        {
+            cp = (uint32_t(*p & 0x1F) << 6) | uint32_t(p[1] & 0x3F);
+            p += 2;
+        }
+        else if ((*p & 0xF0) == 0xE0 && p + 2 < end)
+        {
+            cp = (uint32_t(*p & 0x0F) << 12) | (uint32_t(p[1] & 0x3F) << 6) | uint32_t(p[2] & 0x3F);
+            p += 3;
+        }
+        else if ((*p & 0xF8) == 0xF0 && p + 3 < end)
+        {
+            cp = (uint32_t(*p & 0x07) << 18) | (uint32_t(p[1] & 0x3F) << 12) |
+                 (uint32_t(p[2] & 0x3F) << 6) | uint32_t(p[3] & 0x3F);
+            p += 4;
+        }
+        else
+        {
+            return false;
+        }
+        const bool ok = (cp >= 0x20 && cp < 0x7F) ||
+                        (cp >= 0x4E00 && cp <= 0x9FFF) ||
+                        cp == 0x3001 || cp == 0x3002 || cp == 0xFF0C ||
+                        cp == 0x00B7 || cp == 0x2014;
+        if (!ok) return false;
+    }
     return true;
 }
 
@@ -263,7 +323,10 @@ std::vector<KittyMemoryEx::ProcMap> CandidateMaps(const json &args, const MapSna
     std::vector<KittyMemoryEx::ProcMap> maps;
     for (const auto &map : snapshot.maps)
     {
-        if (!map.readable) continue;
+        // 国服 FNamePool / GUObjectArray 落在 [anon:.bss]，perms 无 r（readable=false）但
+        // pread 回退读得到。只放行 readable 会让 region=BSS 跳过真池所在的那个 VMA——
+        // 实测 scanGnames 因此只报了一个 score 30 的结构假阳性，真池从不进榜。
+        if (!map.readable && !map.writeable) continue;
         if (!mapIds.empty() && !mapIds.count(MapId(map))) continue;
         const bool ueModule = map.pathname.find("libUE4.so") != std::string::npos ||
                               map.pathname.find("libUnreal.so") != std::string::npos;
@@ -278,27 +341,133 @@ std::vector<KittyMemoryEx::ProcMap> CandidateMaps(const json &args, const MapSna
         if (use) maps.push_back(map);
     }
     if (maps.empty()) throw HandlerError(Err::kNotFound, "候选扫描范围内没有可读映射");
+    // FNamePool / GUObjectArray 落在 [anon:.bss]——Android 给已加载 ELF 的 .bss 的命名。
+    // 光按大小降序排是错的：进程里同时有 GB 级的 dalvik-LinearAlloc / jit-cache / GPU
+    // 映射，DFM 可写映射共 4167MB/1800 个、最大的两个各 1GB，64MB 预算会被它们整段吃掉，
+    // 真池所在的 14.7MB [anon:.bss] 永远轮不到（实测 scannedBytes=64MB、candidates=0）。
+    // 所以先按「像不像 UE 的 BSS」分级，同级内再按大小降序。
+    // 指定了 mapIds 时调用方已经圈定范围，保持原顺序。
+    if (mapIds.empty())
+    {
+        const auto regionRank = [](const KittyMemoryEx::ProcMap &m) -> int
+        {
+            const std::string &p = m.pathname;
+            // .bss 必须排在 .so 自己的段之前：FNamePool/GUObjectArray 在 [anon:.bss] 里，
+            // 而 .so 的 rw 数据段全是 vtable/指针数组，会瞬间把 maxCandidates 刷满。
+            if (p.find(".bss") != std::string::npos) return 0;
+            if (p.find("libUE4.so") != std::string::npos ||
+                p.find("libUnreal.so") != std::string::npos)
+                return 1;
+            const bool noise = p.find("dalvik") != std::string::npos ||
+                               p.find("jit") != std::string::npos ||
+                               p.find("mali") != std::string::npos ||
+                               p.find("gralloc") != std::string::npos ||
+                               p.find("ashmem") != std::string::npos ||
+                               p.rfind("/dev/", 0) == 0;
+            if (noise) return 3;
+            return (p.empty() || p.front() == '[') ? 2 : 3;
+        };
+        std::sort(maps.begin(), maps.end(),
+                  [&regionRank](const KittyMemoryEx::ProcMap &a, const KittyMemoryEx::ProcMap &b)
+                  {
+                      const int ra = regionRank(a), rb = regionRank(b);
+                      if (ra != rb) return ra < rb;
+                      const size_t sa = a.endAddress > a.startAddress
+                          ? static_cast<size_t>(a.endAddress - a.startAddress) : 0;
+                      const size_t sb = b.endAddress > b.startAddress
+                          ? static_cast<size_t>(b.endAddress - b.startAddress) : 0;
+                      return sa > sb;
+                  });
+        if (names && region == "BSS")
+        {
+            constexpr size_t kMinBssBytes = 256 * 1024;
+            maps.erase(std::remove_if(maps.begin(), maps.end(),
+                       [](const KittyMemoryEx::ProcMap &m)
+                       {
+                           const size_t n = m.endAddress > m.startAddress
+                               ? static_cast<size_t>(m.endAddress - m.startAddress) : 0;
+                           return n < kMinBssBytes;
+                       }),
+                       maps.end());
+            if (maps.empty())
+                throw HandlerError(Err::kNotFound, "候选扫描范围内没有可读映射");
+        }
+    }
     return maps;
 }
 
-bool DecodeNameAt(const KittyMemoryMgr &mgr, uintptr_t block, uint32_t offsetUnits,
-                  const NameLayout &layout, std::string &name, std::string &failure)
+// FName 正文的字节处理方式。见 Utils/NameCipher.hpp。
+enum class NameDecode
 {
-    const uintptr_t entry = block + static_cast<uintptr_t>(offsetUnits) * layout.stride;
+    Raw,     // 当明文用，不做任何变换
+    Cipher,  // 强制按该变换解一遍
+    Auto,    // 解一遍，只有解出来明显比原文更像名字时才采用（对不加密的游戏等价于 Raw）
+};
+
+const char *NameDecodeName(NameDecode mode)
+{
+    switch (mode)
+    {
+    case NameDecode::Cipher: return "dfm";
+    case NameDecode::Auto:   return "auto";
+    default:                 return "none";
+    }
+}
+
+NameDecode ParseNameDecode(const std::string &value)
+{
+    if (value == "dfm" || value == "cipher") return NameDecode::Cipher;
+    if (value == "none" || value == "raw") return NameDecode::Raw;
+    if (value == "auto") return NameDecode::Auto;
+    throw HandlerError(Err::kBadArgs, "decode 须为 auto / dfm / none");
+}
+
+bool ReadNameHeader(const KittyMemoryMgr &mgr, uintptr_t entry, const NameLayout &layout,
+                    size_t &length, bool &wide)
+{
     uint16_t header = 0;
     if (!ReadValue(mgr, entry + layout.headerOff, header))
+        return false;
+    length = header >> layout.lengthShift;
+    wide = (header & 1) != 0;
+    return true;
+}
+
+// 条目字节数 → 走到下一个真实 id 的步长。FNamePool 的 id 就是「字节偏移 / stride」，
+// 条目首尾相接，所以相邻两个真实 id 的间隔 = 条目占位 / stride，而不是 1。
+// 按 id 自增枚举会落进条目正文中间，把后续若干条目拼成一个长串（夹在被当正文的 2 字节
+// header），看起来就是一串 "??"。要顺序枚举就必须用这个步长走。
+//
+// 占位要把字节数向上对齐到 stride：分配器 FNameEntryAllocator::Allocate 就是这么切的，
+// 用裸的 2 + 正文会漏掉对齐填充。奇数长的名字会因此错位（"Color" len 5 真实占 8 字节、
+// 下一个 id 是 +4，按 2+5=7 算成 +3 就踩进下一条目的正文），之后整条链全歪。
+int32_t NameEntryStep(size_t length, bool wide, uintptr_t stride)
+{
+    if (!stride) stride = 2;
+    const size_t bytes = sizeof(uint16_t) + (wide ? length * 2 : length);
+    const size_t padded = (bytes + stride - 1) / stride * stride;
+    return static_cast<int32_t>(padded / stride);
+}
+
+bool DecodeNameAt(const KittyMemoryMgr &mgr, uintptr_t block, uint32_t offsetUnits,
+                  const NameLayout &layout, std::string &name, std::string &failure,
+                  NameDecode mode = NameDecode::Raw, bool *outDecoded = nullptr)
+{
+    if (outDecoded) *outDecoded = false;
+    const uintptr_t entry = block + static_cast<uintptr_t>(offsetUnits) * layout.stride;
+    size_t length = 0;
+    bool wide = false;
+    if (!ReadNameHeader(mgr, entry, layout, length, wide))
     {
         failure = "entry header unreadable";
         return false;
     }
-    const size_t length = header >> layout.lengthShift;
-    const bool wide = (header & 1) != 0;
     if (length < 1 || length > 127)
     {
         failure = "entry length out of range";
         return false;
     }
-    const uintptr_t text = entry + layout.headerOff + sizeof(header);
+    const uintptr_t text = entry + layout.headerOff + sizeof(uint16_t);
     if (!wide)
     {
         std::vector<char> bytes(length);
@@ -308,20 +477,64 @@ bool DecodeNameAt(const KittyMemoryMgr &mgr, uintptr_t block, uint32_t offsetUni
             return false;
         }
         name.assign(bytes.begin(), bytes.end());
+        if (mode != NameDecode::Raw)
+        {
+            std::string dec = name;
+            UmtNameCipher::DecodeAnsi(dec);
+            // Auto 的判据：解出来是纯 ASCII 可见字符、而原文不是。密文里出现 >=0x80 很常见
+            // （None 的密文是 b1 90 91 9a），所以这条能把「解对了」和「本来就不用解」分开；
+            // 对不加密的游戏原文本来就是纯 ASCII，Auto 会保持原样，不会误伤。
+            const bool take = (mode == NameDecode::Cipher) ||
+                              (IsPlainAsciiName(dec) && !IsPlainAsciiName(name));
+            if (take)
+            {
+                name.swap(dec);
+                if (outDecoded) *outDecoded = true;
+            }
+        }
     }
     else
     {
-        std::vector<uint16_t> chars(length);
-        if (mgr.readMem(text, chars.data(), length * sizeof(uint16_t)) != length * sizeof(uint16_t))
+        // 宽字符正文是 UTF-16LE，长度是字符数。旧实现按 ASCII 截断并在 ch>0x7F 直接失败，
+        // 所以 CJK 名在候选扫描里永远看不见。解码走 NameCipher 那条已经在 dump 路径验证过
+        // 的 DecodeWideToUtf8；Raw 只做 UTF-16→UTF-8，不异或。
+        std::vector<char> body(length * 2);
+        if (mgr.readMem(text, body.data(), body.size()) != body.size())
         {
             failure = "wide entry bytes unreadable";
             return false;
         }
-        name.clear();
-        for (uint16_t ch : chars)
+        const auto chars = static_cast<uint32_t>(length);
+        if (mode == NameDecode::Raw)
         {
-            if (ch > 0x7F) { failure = "wide non-ASCII sample"; return false; }
-            name.push_back(static_cast<char>(ch));
+            name = UmtNameCipher::Utf16LeToUtf8(body.data(), chars);
+        }
+        else
+        {
+            std::string dec = UmtNameCipher::DecodeWideToUtf8(body.data(), chars);
+            if (mode == NameDecode::Cipher)
+            {
+                name.swap(dec);
+                if (outDecoded) *outDecoded = true;
+            }
+            else
+            {
+                std::string rawUtf8 = UmtNameCipher::Utf16LeToUtf8(body.data(), chars);
+                // 跟 ANSI Auto 同一结构：解出来像名字、原文不像，才采用。未加密的宽字符
+                // 游戏原文已经 plausible，Auto 保持原样。
+                // 变换是对合，所以「两边都像名字」时 Auto 无法判断该不该解——DFM 的 L=2
+                // 「地图」密文本身也是 CJK（啯图），Auto 会留下密文。要解这种名字用 decode=dfm。
+                const bool take = IsPlausibleFName(dec) && !IsPlausibleFName(rawUtf8);
+                if (take)
+                {
+                    name.swap(dec);
+                    if (outDecoded) *outDecoded = true;
+                }
+                else
+                {
+                    name.swap(rawUtf8);
+                }
+            }
         }
     }
     if (!IsPrintableName(name))
@@ -333,7 +546,8 @@ bool DecodeNameAt(const KittyMemoryMgr &mgr, uintptr_t block, uint32_t offsetUni
 }
 
 bool DecodeNameId(const KittyMemoryMgr &mgr, const NameCandidate &candidate, int32_t id,
-                  std::string &name, std::string &failure)
+                  std::string &name, std::string &failure,
+                  NameDecode mode = NameDecode::Raw, bool *outDecoded = nullptr)
 {
     if (id < 0) { failure = "negative name id"; return false; }
     const uint32_t blockIndex = static_cast<uint32_t>(id) >> candidate.layout.blocksBit;
@@ -345,19 +559,21 @@ bool DecodeNameId(const KittyMemoryMgr &mgr, const NameCandidate &candidate, int
         failure = "block pointer unreadable";
         return false;
     }
-    return DecodeNameAt(mgr, block, offset, candidate.layout, name, failure);
+    return DecodeNameAt(mgr, block, offset, candidate.layout, name, failure, mode, outDecoded);
 }
 
 NameCandidate ValidateNameCandidate(const KittyMemoryMgr &mgr, const MapSnapshot &snapshot,
-                                    uintptr_t pool, uintptr_t slot, const NameLayout &layout,
+                                    uintptr_t pool, uintptr_t slot, uintptr_t blockValue,
+                                    const NameLayout &layout,
                                     const std::vector<uint32_t> &anchorOffsets,
-                                    const std::unordered_set<std::string> &anchorNames)
+                                    const std::unordered_set<std::string> &anchorNames,
+                                    NameDecode mode)
 {
     NameCandidate candidate;
     candidate.poolAddress = pool;
     candidate.slotAddress = slot;
     candidate.layout = layout;
-    if (IsReadableAddress(snapshot, pool, layout.blocksOff + sizeof(uintptr_t)))
+    if (IsAccessibleAddress(snapshot, pool, layout.blocksOff + sizeof(uintptr_t)))
     {
         candidate.score += 5;
         candidate.evidence.push_back("pool address is readable");
@@ -367,24 +583,48 @@ NameCandidate ValidateNameCandidate(const KittyMemoryMgr &mgr, const MapSnapshot
         candidate.failedChecks.push_back("pool address is not readable");
         return candidate;
     }
-    if (!ReadValue(mgr, pool + layout.blocksOff, candidate.block0) ||
-        !IsReadableAddress(snapshot, candidate.block0, 4))
+    // blockValue 由调用方传入：它就是调用方在缓冲里已经读到的 *(uintptr_t*)slot，而
+    // 调用方是拿 pool = slot - blocksOff 反推的，所以 pool + blocksOff == slot，
+    // 这里再 ReadValue 一次读的是同一个地址 —— 纯冗余的 pread 系统调用。
+    // 扫描热循环里每个候选省一次，是实测耗时的大头之一。
+    if (!IsAccessibleAddress(snapshot, blockValue, 4))
     {
         candidate.failedChecks.push_back("Blocks[0] is unreadable");
         return candidate;
     }
+    candidate.block0 = blockValue;
     candidate.score += 10;
     candidate.evidence.push_back({{"check", "Blocks[0] readable"},
                                   {"address", FormatAddress(candidate.block0)}});
+
+    // 廉价前置门禁：真池的 Blocks[0] 指向一个名称块，其首个条目（偏移 0）必然是合法条目
+    // —— UE 的 FNamePool 块从第一个被分配的条目开始，索引 0 就是 "None"。所以「偏移 0 的
+    // header 不可读或长度越界」的候选可以直接判死，不必再走完 8 个锚点偏移。
+    // 每个被挡掉的候选省下 7 次 pread；扫描热循环里有上百万个候选，这是主要开销。
+    // 仅在调用方确实会试 offset 0 时启用（默认 anchorOffsets 以 0 开头）；调用方传了
+    // 不含 0 的自定义偏移时跳过此门禁，保持原有语义、避免误杀。
+    if (!anchorOffsets.empty() && anchorOffsets.front() == 0)
+    {
+        size_t len0 = 0;
+        bool wide0 = false;
+        if (!ReadNameHeader(mgr, candidate.block0, layout, len0, wide0) || len0 < 1 || len0 > 127)
+        {
+            candidate.failedChecks.push_back("Blocks[0] first entry header invalid");
+            return candidate;
+        }
+    }
 
     int valid = 0, anchors = 0;
     for (uint32_t offset : anchorOffsets)
     {
         std::string name, failure;
-        if (!DecodeNameAt(mgr, candidate.block0, offset, layout, name, failure)) continue;
+        bool decoded = false;
+        // 必须按 mode 解一遍再比：DFM 这类游戏的正文是异或过的，拿密文跟 "None"/anchor
+        // 比永远不相等，于是锚点分（+15/+8/+20）在这类游戏上恒为 0，候选自校验形同虚设。
+        if (!DecodeNameAt(mgr, candidate.block0, offset, layout, name, failure, mode, &decoded)) continue;
         ++valid;
         if (candidate.evidence.size() < 5)
-            candidate.evidence.push_back({{"offset", offset}, {"name", name}});
+            candidate.evidence.push_back({{"offset", offset}, {"name", name}, {"decoded", decoded}});
         if (name == "None") candidate.score += 15;
         if (anchorNames.count(name)) { ++anchors; candidate.score += 8; }
     }
@@ -392,34 +632,32 @@ NameCandidate ValidateNameCandidate(const KittyMemoryMgr &mgr, const MapSnapshot
     else candidate.failedChecks.push_back("fewer than three anchor offsets decoded");
     if (anchors >= 3) candidate.score += 20;
     else if (anchors == 0) candidate.failedChecks.push_back("no requested anchor name matched");
+    candidate.anchorHits = anchors;
     return candidate;
 }
 
+// 进程身份只看 pid + starttime。整份 /proc/pid/maps 的 FNV 会因无关 VMA
+// （堆、GPU、ashmem、JIT）抖动而变，DFM 上扫描刚结束 sample 就会 E_MAP_STALE。
+// sample / override 真正依赖的是候选地址还在；可读性由调用方用 snapshot 验。
 const NameCandidate &GetNameCandidate(const std::string &sessionId, int candidateId,
-                                      pid_t pid, uint64_t processStartTime,
-                                      const std::string &revision)
+                                      pid_t pid, uint64_t processStartTime)
 {
     auto it = gNameSessions.find(sessionId);
     if (it == gNameSessions.end() || it->second.pid != pid ||
         it->second.processStartTime != processStartTime)
         throw HandlerError(Err::kSessionStale, "names candidate session 不存在或进程已切换");
-    if (it->second.revision != revision)
-        throw HandlerError(Err::kMapStale, "names candidate session 的 maps revision 已变化");
     for (const auto &candidate : it->second.candidates)
         if (candidate.id == candidateId) return candidate;
     throw HandlerError(Err::kSessionStale, "names candidateId 不存在");
 }
 
 const ObjectCandidate &GetObjectCandidate(const std::string &sessionId, int candidateId,
-                                          pid_t pid, uint64_t processStartTime,
-                                          const std::string &revision)
+                                          pid_t pid, uint64_t processStartTime)
 {
     auto it = gObjectSessions.find(sessionId);
     if (it == gObjectSessions.end() || it->second.pid != pid ||
         it->second.processStartTime != processStartTime)
         throw HandlerError(Err::kSessionStale, "objects candidate session 不存在或进程已切换");
-    if (it->second.revision != revision)
-        throw HandlerError(Err::kMapStale, "objects candidate session 的 maps revision 已变化");
     for (const auto &candidate : it->second.candidates)
         if (candidate.id == candidateId) return candidate;
     throw HandlerError(Err::kSessionStale, "objects candidateId 不存在");
@@ -491,10 +729,10 @@ ObjectCandidate ValidateObjectCandidate(const KittyMemoryMgr &mgr, const MapSnap
     for (int32_t i = 0; i < std::min<int32_t>(candidate.numElements, 32); ++i)
     {
         uintptr_t object = 0;
-        if (!ReadObjectAt(mgr, candidate, i, object) || !IsReadableAddress(snapshot, object, 8)) continue;
+        if (!ReadObjectAt(mgr, candidate, i, object) || !IsAccessibleAddress(snapshot, object, 8)) continue;
         ++readableObjects;
         uintptr_t klass = 0;
-        if (ReadValue(mgr, object + layout.classPrivateOff, klass) && IsReadableAddress(snapshot, klass, 8))
+        if (ReadValue(mgr, object + layout.classPrivateOff, klass) && IsAccessibleAddress(snapshot, klass, 8))
             ++readableClasses;
     }
     if (readableObjects >= 3)
@@ -513,7 +751,7 @@ ObjectCandidate ValidateObjectCandidate(const KittyMemoryMgr &mgr, const MapSnap
 }
 
 void EnhanceObjectCandidateWithNames(const KittyMemoryMgr &mgr, ObjectCandidate &candidate,
-                                     const NameCandidate &names)
+                                     const NameCandidate &names, NameDecode mode)
 {
     int decoded = 0;
     int anchors = 0;
@@ -524,7 +762,7 @@ void EnhanceObjectCandidateWithNames(const KittyMemoryMgr &mgr, ObjectCandidate 
         int32_t nameId = -1;
         if (!ReadValue(mgr, object + candidate.layout.namePrivateOff, nameId)) continue;
         std::string name, failure;
-        if (!DecodeNameId(mgr, names, nameId, name, failure)) continue;
+        if (!DecodeNameId(mgr, names, nameId, name, failure, mode)) continue;
         ++decoded;
         if (name == "Object" || name == "Package" || name == "Class" ||
             name.find("CoreUObject") != std::string::npos)
@@ -556,14 +794,23 @@ json ScanGNamesCandidates(const json &args, const KittyMemoryMgr &mgr, const std
         if (it == gNameSessions.end() || it->second.pid != snapshot.pid ||
             it->second.processStartTime != snapshot.processStartTime)
             throw HandlerError(Err::kSessionStale, "names candidate session 不存在或进程已切换");
-        if (it->second.revision != snapshot.revision)
-            throw HandlerError(Err::kMapStale, "names candidate session 的 maps revision 已变化");
         return PageCandidates(it->second, args, NameCandidateJson);
     }
     const auto maps = CandidateMaps(args, snapshot, true);
     std::vector<NameLayout> layouts;
     for (const auto &item : args.value("layouts", json::array())) layouts.push_back(ParseNameLayout(item));
-    if (layouts.empty()) layouts.push_back({});
+    if (layouts.empty())
+    {
+        // 调用方没给布局时不能只试标准 UE 那一套（BlocksOff 0x40 / BlocksBit 16）：
+        // 国服的块表比标准版前移一个指针、块位宽也是 18（DeltaForce.hpp 里
+        // BlocksBit=18、BlocksOff -= sizeof(void*)），只试标准布局时真池永远进不了候选。
+        // 多一套布局的代价只是内层多跑一遍自校验——外层槽位过滤与布局无关。
+        layouts.push_back({});
+        NameLayout cn{};
+        cn.blocksOff -= static_cast<uint32_t>(sizeof(void *));
+        cn.blocksBit = 18;
+        layouts.push_back(cn);
+    }
     std::vector<uint32_t> anchorOffsets = {0, 2, 4, 6, 8, 10, 12, 16};
     if (args.contains("anchorOffsets") && args["anchorOffsets"].is_array())
     {
@@ -577,6 +824,9 @@ json ScanGNamesCandidates(const json &args, const KittyMemoryMgr &mgr, const std
     std::unordered_set<std::string> anchorNames = {"None", "ByteProperty", "IntProperty", "Object"};
     for (const auto &name : args.value("anchorNames", json::array()))
         if (name.is_string()) anchorNames.insert(name.get<std::string>());
+    // decode: "auto"（默认，解一遍、只有更像名字才采用）/ "dfm"（强制解）/ "none"（当明文）。
+    // 不加密的游戏用 auto 等价于 none，所以默认值对两边都安全。
+    const NameDecode mode = ParseNameDecode(args.value("decode", "auto"));
     const int maxCandidates = std::clamp(args.value("maxCandidates", 50), 1, 200);
     const size_t budget = static_cast<size_t>(std::clamp<int64_t>(
         args.value("maxScanBytes", static_cast<int64_t>(kDefaultScanBudget)), 4096, 256LL * 1024 * 1024));
@@ -593,16 +843,37 @@ json ScanGNamesCandidates(const json &args, const KittyMemoryMgr &mgr, const std
     session.processStartTime = snapshot.processStartTime;
     session.revision = snapshot.revision;
     session.id = NewId("names");
-    std::unordered_set<std::string> seen;
     size_t scanned = 0, skipped = 0;
     bool truncated = false;
     std::vector<uint8_t> buffer(kChunk);
+    uint32_t minBlocksOff = layouts[0].blocksOff;
+    uint32_t maxBlocksOff = layouts[0].blocksOff;
+    for (const auto &layout : layouts)
+    {
+        minBlocksOff = std::min(minBlocksOff, layout.blocksOff);
+        maxBlocksOff = std::max(maxBlocksOff, layout.blocksOff);
+    }
     for (const auto &map : maps)
     {
-        for (uintptr_t cursor = map.startAddress; cursor < map.endAddress && scanned < budget; cursor += kChunk)
+        // minPtr/maxPtr 过滤的是 pool 地址，slot = pool + blocksOff。
+        // 不跳过窗口外的 chunk 就会从 BSS 头读十几 MB 才碰到真池（job_11 扫了 15MB
+        // 才命中 192 字节窗口里的 0x7408a96ec0）。
+        uintptr_t rangeStart = map.startAddress;
+        uintptr_t rangeEnd = map.endAddress;
+        if (minPtr != 0 || maxPtr != std::numeric_limits<uintptr_t>::max())
+        {
+            const uintptr_t slotLo = minPtr > std::numeric_limits<uintptr_t>::max() - minBlocksOff
+                ? std::numeric_limits<uintptr_t>::max() : minPtr + minBlocksOff;
+            const uintptr_t slotHi = maxPtr > std::numeric_limits<uintptr_t>::max() - maxBlocksOff
+                ? std::numeric_limits<uintptr_t>::max() : maxPtr + maxBlocksOff;
+            if (slotLo > rangeStart) rangeStart = slotLo & ~static_cast<uintptr_t>(7);
+            if (slotHi < rangeEnd) rangeEnd = slotHi;
+            if (rangeEnd <= rangeStart) continue;
+        }
+        for (uintptr_t cursor = rangeStart; cursor < rangeEnd && scanned < budget; cursor += kChunk)
         {
             if (cancelFlag && cancelFlag->load()) throw HandlerError(Err::kCancelled, "FNamePool 候选扫描已取消");
-            const size_t size = std::min<size_t>(kChunk, map.endAddress - cursor);
+            const size_t size = std::min<size_t>(kChunk, rangeEnd - cursor);
             const size_t got = mgr.readMem(cursor, buffer.data(), size);
             if (got < sizeof(uintptr_t)) { skipped += size; continue; }
             scanned += size;
@@ -610,19 +881,26 @@ json ScanGNamesCandidates(const json &args, const KittyMemoryMgr &mgr, const std
             {
                 uintptr_t value = 0;
                 std::memcpy(&value, buffer.data() + off, sizeof(value));
-                if (!IsReadableAddress(snapshot, value, 4)) continue;
+                if (!IsAccessibleAddress(snapshot, value, 4)) continue;
                 const uintptr_t slot = cursor + off;
                 for (const auto &layout : layouts)
                 {
                     uintptr_t pool = slot >= layout.blocksOff ? slot - layout.blocksOff : 0;
-                    if (pool < minPtr || pool >= maxPtr) continue;
-                    std::ostringstream key;
-                    key << std::hex << pool << ':' << layout.stride << ':' << layout.blocksBit
-                        << ':' << layout.blocksOff << ':' << layout.headerOff << ':' << layout.lengthShift;
-                    if (!pool || !seen.insert(key.str()).second) continue;
-                    NameCandidate candidate = ValidateNameCandidate(mgr, snapshot, pool, slot, layout,
-                                                                    anchorOffsets, anchorNames);
-                    if (candidate.score < 15) continue;
+                    if (!pool || pool < minPtr || pool >= maxPtr) continue;
+                    // 这里曾经有一个 seen 去重集（键是 pool+layout 拼成的十六进制字符串）。
+                    // 它是多余的：slot = cursor + off 在一趟线性扫描里全局唯一（块内不重叠、
+                    // maps 之间不重叠），所以 (pool, layout) 本来就不会重复。而它每个槽位都要
+                    // 构造一次 ostringstream + std::string（堆分配 + locale 格式化），
+                    // 8.4M 槽 × 2 布局 = 上千万次，是扫描耗时最大的单项。
+                    NameCandidate candidate = ValidateNameCandidate(mgr, snapshot, pool, slot, value,
+                                                                    layout, anchorOffsets, anchorNames,
+                                                                    mode);
+                    // 光靠分数筛不住：5(池可访问) + 10(Blocks[0] 可访问) + 15(解出 ≥3 个偏移)
+                    // = 30 分是「指针密集段」的垃圾地板。实测扫 libUE4 自己的 rw 数据段，
+                    // 1MB 内就刷满 20 个 30 分假货（anchors 全为 0），真池永远进不了榜。
+                    // 真池必然在某个偏移解出锚点名（None 在 offset 0），所以判据用锚点命中数，
+                    // 不用分数阈值。
+                    if (candidate.anchorHits == 0) continue;
                     candidate.id = static_cast<int>(session.candidates.size());
                     session.candidates.push_back(std::move(candidate));
                     if (static_cast<int>(session.candidates.size()) >= maxCandidates)
@@ -639,8 +917,7 @@ json ScanGNamesCandidates(const json &args, const KittyMemoryMgr &mgr, const std
     }
     std::sort(session.candidates.begin(), session.candidates.end(),
               [](const NameCandidate &a, const NameCandidate &b) { return a.score > b.score; });
-    if (CurrentMapRevision(mgr) != snapshot.revision)
-        throw HandlerError(Err::kMapStale, "FNamePool 候选扫描期间 maps revision 已变化");
+    // 扫描期间 maps 抖动不再丢结果：候选地址的可读性由 sample 再验。
     for (size_t i = 0; i < session.candidates.size(); ++i) session.candidates[i].id = static_cast<int>(i);
     session.scannedBytes = scanned;
     session.skippedBytes = skipped;
@@ -665,18 +942,45 @@ json SampleGNamesCandidate(const json &args, const KittyMemoryMgr &mgr)
     if (start < 0) throw HandlerError(Err::kBadArgs, "startIndex 须 >= 0");
     std::lock_guard<std::mutex> lock(gCandidateMutex);
     const NameCandidate &candidate = GetNameCandidate(sessionId, candidateId, snapshot.pid,
-                                                       snapshot.processStartTime, snapshot.revision);
+                                                       snapshot.processStartTime);
+    if (!IsReadableAddress(snapshot, candidate.poolAddress,
+                           candidate.layout.blocksOff + sizeof(uintptr_t)))
+        throw HandlerError(Err::kMapStale, "names candidate 的 FNamePool 已不可读");
+    const NameDecode mode = ParseNameDecode(args.value("decode", "auto"));
+    // walk 默认 true：沿条目链走（见 NameEntryStep 的说明）。传 false 退回按 id 自增，
+    // 用来对照「某个 id 是不是刚好踩在条目边界上」——稠密模式下大量 valid=false 就说明
+    // 这个池子的 id 不稠密。
+    const bool walk = args.value("walk", true);
     json samples = json::array(), errors = json::array();
-    for (int32_t id = start; id < start + count; ++id)
+    int32_t id = start;
+    for (int32_t n = 0; n < count; ++n)
     {
         std::string name, failure;
-        const bool valid = DecodeNameId(mgr, candidate, id, name, failure);
-        samples.push_back({{"index", id}, {"name", name}, {"valid", valid}});
+        bool decoded = false;
+        const bool valid = DecodeNameId(mgr, candidate, id, name, failure, mode, &decoded);
+        samples.push_back({{"index", id}, {"name", name}, {"valid", valid}, {"decoded", decoded}});
         if (!valid && errors.size() < 16) errors.push_back({{"index", id}, {"reason", failure}});
+        if (!walk) { ++id; continue; }
+        // 步长从 header 现算：len 就在条目里，不依赖调用方传 stride/blockBit 之外的东西
+        uintptr_t block = 0;
+        const uint32_t blockIndex = static_cast<uint32_t>(id) >> candidate.layout.blocksBit;
+        const uint32_t off = static_cast<uint32_t>(id) & ((1U << candidate.layout.blocksBit) - 1U);
+        size_t len = 0;
+        bool wide = false;
+        if (id < 0 ||
+            !ReadValue(mgr, candidate.poolAddress + candidate.layout.blocksOff +
+                                static_cast<uintptr_t>(blockIndex) * sizeof(uintptr_t), block) ||
+            !block || !ReadNameHeader(mgr, block + static_cast<uintptr_t>(off) * candidate.layout.stride,
+                                      candidate.layout, len, wide))
+            break;
+        const int32_t step = NameEntryStep(len, wide, candidate.layout.stride);
+        if (step <= 0) break;
+        id += step;
     }
     return {{"sessionId", sessionId}, {"candidateId", candidateId},
             {"poolAddress", FormatAddress(candidate.poolAddress)}, {"layout", NameLayoutJson(candidate.layout)},
-            {"startIndex", start}, {"count", count}, {"samples", samples}, {"readErrors", errors}};
+            {"startIndex", start}, {"count", count}, {"walk", walk}, {"decode", NameDecodeName(mode)},
+            {"samples", samples}, {"readErrors", errors}};
 }
 
 json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std::atomic<bool> *cancelFlag)
@@ -691,8 +995,6 @@ json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std
         if (it == gObjectSessions.end() || it->second.pid != snapshot.pid ||
             it->second.processStartTime != snapshot.processStartTime)
             throw HandlerError(Err::kSessionStale, "objects candidate session 不存在或进程已切换");
-        if (it->second.revision != snapshot.revision)
-            throw HandlerError(Err::kMapStale, "objects candidate session 的 maps revision 已变化");
         return PageCandidates(it->second, args, ObjectCandidateJson);
     }
     const auto maps = CandidateMaps(args, snapshot, false);
@@ -706,6 +1008,8 @@ json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std
         layouts.push_back(flat);
     }
     const int maxCandidates = std::clamp(args.value("maxCandidates", 50), 1, 200);
+    // 名字池正文的处理方式；配合 namesCandidate 做锚点匹配时，拿密文比 "Object" 永远不中
+    const NameDecode mode = ParseNameDecode(args.value("decode", "auto"));
     const size_t budget = static_cast<size_t>(std::clamp<int64_t>(
         args.value("maxDistanceBytes", static_cast<int64_t>(kDefaultScanBudget)), 4096, 256LL * 1024 * 1024));
 
@@ -742,7 +1046,7 @@ json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std
             throw HandlerError(Err::kBadArgs, "namesSessionId 与 namesCandidateId 必须同时提供");
         std::lock_guard<std::mutex> lock(gCandidateMutex);
         namesCandidate = GetNameCandidate(namesSessionId, namesCandidateId,
-                                          snapshot.pid, snapshot.processStartTime, snapshot.revision);
+                                          snapshot.pid, snapshot.processStartTime);
     }
     size_t scanned = 0, skipped = 0;
     bool truncated = false;
@@ -785,7 +1089,7 @@ json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std
                     if (!seen.insert(key.str()).second) continue;
                     ObjectCandidate candidate = ValidateObjectCandidate(mgr, snapshot, address, layout);
                     if (candidate.score < 25) continue;
-                    if (namesCandidate) EnhanceObjectCandidateWithNames(mgr, candidate, *namesCandidate);
+                    if (namesCandidate) EnhanceObjectCandidateWithNames(mgr, candidate, *namesCandidate, mode);
                     candidate.id = static_cast<int>(session.candidates.size());
                     candidate.namesSessionId = namesSessionId;
                     candidate.namesCandidateId = namesCandidateId;
@@ -804,8 +1108,7 @@ json ScanObjectCandidates(const json &args, const KittyMemoryMgr &mgr, const std
     }
     std::sort(session.candidates.begin(), session.candidates.end(),
               [](const ObjectCandidate &a, const ObjectCandidate &b) { return a.score > b.score; });
-    if (CurrentMapRevision(mgr) != snapshot.revision)
-        throw HandlerError(Err::kMapStale, "GUObjectArray 候选扫描期间 maps revision 已变化");
+    // 同 ScanGNamesCandidates：扫描期间 maps 抖动不该丢结果，候选地址可读性由 sample 再验。
     for (size_t i = 0; i < session.candidates.size(); ++i) session.candidates[i].id = static_cast<int>(i);
     session.scannedBytes = scanned;
     session.skippedBytes = skipped;
@@ -826,9 +1129,10 @@ json SampleObjectCandidate(const json &args, const KittyMemoryMgr &mgr)
     const int candidateId = args.value("candidateId", -1);
     const int32_t start = args.value("startIndex", 0);
     const int32_t count = std::clamp(args.value("count", 32), 1, 200);
+    const NameDecode mode = ParseNameDecode(args.value("decode", "auto"));
     std::lock_guard<std::mutex> lock(gCandidateMutex);
     const ObjectCandidate &candidate = GetObjectCandidate(sessionId, candidateId, snapshot.pid,
-                                                          snapshot.processStartTime, snapshot.revision);
+                                                          snapshot.processStartTime);
     if (start < 0 || start >= candidate.numElements)
         throw HandlerError(Err::kBadArgs, "startIndex 越界");
 
@@ -836,7 +1140,7 @@ json SampleObjectCandidate(const json &args, const KittyMemoryMgr &mgr)
     if (!candidate.namesSessionId.empty() && candidate.namesCandidateId >= 0)
     {
         try { names = &GetNameCandidate(candidate.namesSessionId, candidate.namesCandidateId,
-                                        snapshot.pid, snapshot.processStartTime, snapshot.revision); }
+                                        snapshot.pid, snapshot.processStartTime); }
         catch (const HandlerError &) { names = nullptr; }
     }
     json samples = json::array(), errors = json::array();
@@ -853,10 +1157,11 @@ json SampleObjectCandidate(const json &args, const KittyMemoryMgr &mgr)
             ReadValue(mgr, object + candidate.layout.namePrivateOff, nameId);
         }
         std::string name, failure;
-        if (valid && names) DecodeNameId(mgr, *names, nameId, name, failure);
+        bool decoded = false;
+        if (valid && names) DecodeNameId(mgr, *names, nameId, name, failure, mode, &decoded);
         samples.push_back({{"index", index},
                            {"objectAddress", gotObject ? json(FormatAddress(object)) : json(nullptr)},
-                           {"nameId", nameId}, {"name", name},
+                           {"nameId", nameId}, {"name", name}, {"decoded", decoded},
                            {"classAddress", klass ? json(FormatAddress(klass)) : json(nullptr)},
                            {"outerAddress", outer ? json(FormatAddress(outer)) : json(nullptr)},
                            {"valid", valid}});
@@ -864,12 +1169,12 @@ json SampleObjectCandidate(const json &args, const KittyMemoryMgr &mgr)
     }
     return {{"sessionId", sessionId}, {"candidateId", candidateId},
             {"arrayAddress", FormatAddress(candidate.arrayAddress)}, {"numElements", candidate.numElements},
-            {"layout", ObjectLayoutJson(candidate.layout)}, {"samples", samples}, {"readErrors", errors}};
+            {"layout", ObjectLayoutJson(candidate.layout)}, {"decode", NameDecodeName(mode)},
+            {"samples", samples}, {"readErrors", errors}};
 }
 
 bool ValidateCandidateBinding(const std::string &kind, const std::string &sessionId,
                               int candidateId, pid_t pid, uint64_t processStartTime,
-                              const std::string &mapRevision,
                               uintptr_t address, std::string &reason)
 {
     std::lock_guard<std::mutex> lock(gCandidateMutex);
@@ -878,14 +1183,14 @@ bool ValidateCandidateBinding(const std::string &kind, const std::string &sessio
         if (kind == "names")
         {
             const NameCandidate &candidate = GetNameCandidate(sessionId, candidateId, pid,
-                                                               processStartTime, mapRevision);
+                                                              processStartTime);
             if (candidate.poolAddress != address) { reason = "candidate address mismatch"; return false; }
             return true;
         }
         if (kind == "objects")
         {
             const ObjectCandidate &candidate = GetObjectCandidate(sessionId, candidateId, pid,
-                                                                   processStartTime, mapRevision);
+                                                                  processStartTime);
             if (candidate.arrayAddress != address) { reason = "candidate address mismatch"; return false; }
             return true;
         }

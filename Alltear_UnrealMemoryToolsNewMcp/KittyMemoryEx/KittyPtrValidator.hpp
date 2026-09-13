@@ -59,7 +59,13 @@ public:
     {
         if (ptr == 0) return false;
         RegionInfo region(0, 0, false, false, false);
-        return _findRegion(ptr, &region) && region.readable && (ptr+len) <= region.end;
+        // A writable mapping is always readable. On Android/Linux the kernel keeps
+        // PROT_WRITE-only VMAs -- notably the "-w-p" [anon:.bss] window that carries
+        // FNamePool/GUObjectArray/GWorld/GEngine -- readable through /proc/pid/mem,
+        // even though perms[0] is '-' so RegionInfo::readable stays false. Gating on
+        // `readable` alone made every read of that window fail, which is why those
+        // globals could never be located.
+        return _findRegion(ptr, &region) && (region.readable || region.writable) && (ptr+len) <= region.end;
     }
 
     inline bool isPtrWritable(uintptr_t ptr, size_t len = sizeof(void*))
@@ -165,7 +171,13 @@ public:
     {
         if (ptr == 0) return false;
         RegionInfo region(0, 0, false, false, false);
-        return _findRegion(ptr, &region) && region.readable && (ptr+len) <= region.end;
+        // A writable mapping is always readable. On Android/Linux the kernel keeps
+        // PROT_WRITE-only VMAs -- notably the "-w-p" [anon:.bss] window that carries
+        // FNamePool/GUObjectArray/GWorld/GEngine -- readable through /proc/pid/mem,
+        // even though perms[0] is '-' so RegionInfo::readable stays false. Gating on
+        // `readable` alone made every read of that window fail, which is why those
+        // globals could never be located.
+        return _findRegion(ptr, &region) && (region.readable || region.writable) && (ptr+len) <= region.end;
     }
 
     inline bool isPtrWritable(uintptr_t ptr, size_t len = sizeof(void*))

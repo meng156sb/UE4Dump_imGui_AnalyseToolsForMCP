@@ -25,3 +25,6 @@ build/
 
 # 临时文件
 *.zip
+
+# 本地 dump 校验产物（数十 MB，不入库）
+_dump_verify/

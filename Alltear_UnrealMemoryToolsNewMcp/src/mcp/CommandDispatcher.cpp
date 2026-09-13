@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "../Utils/Logger.hpp"
+#include "../Utils/TextSafe.hpp"
 
 namespace UmtMcp
 {
@@ -84,7 +85,7 @@ bool CommandDispatcher::PollOnce()
         {
             response["ok"] = false;
             response["error"] = {{"code", Err::kBadArgs}, {"msg", std::string("args 解析失败: ") + e.what()}};
-            queue_->PushResponse({req.id, response.dump()});
+            queue_->PushResponse({req.id, UmtText::SafeDump(response)});
             return true;
         }
     }
@@ -97,7 +98,7 @@ bool CommandDispatcher::PollOnce()
         {
             response["ok"] = false;
             response["error"] = {{"code", Err::kUnknownCmd}, {"msg", "未知命令: " + req.cmd}};
-            queue_->PushResponse({req.id, response.dump()});
+            queue_->PushResponse({req.id, UmtText::SafeDump(response)});
             return true;
         }
         handler = it->second;
@@ -146,7 +147,7 @@ bool CommandDispatcher::PollOnce()
         LOGI("[MCP·完成] %s  耗时 %lldms", req.cmd.c_str(), (long long)elapsedMs);
     }
 
-    queue_->PushResponse({req.id, response.dump()});
+    queue_->PushResponse({req.id, UmtText::SafeDump(response)});
     return true;
 }
 

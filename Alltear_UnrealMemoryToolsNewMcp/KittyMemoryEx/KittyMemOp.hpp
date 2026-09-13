@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include "KittyUtils.hpp"
 #include "KittyIOFile.hpp"
 
@@ -32,6 +34,14 @@ public:
 
 class KittyMemSys : public IKittyMemOp
 {
+private:
+    // Lazily opened /proc/<pid>/mem, used only for the chunks process_vm_readv
+    // refuses. See the EFAULT branch in Read() for why that is necessary.
+    mutable std::unique_ptr<KittyIOFile> _pFallbackMem;
+    mutable bool _fallbackUnavailable = false;
+
+    size_t readViaFallback(uintptr_t address, void *buffer, size_t len) const;
+
 public:
     bool init(pid_t pid);
 

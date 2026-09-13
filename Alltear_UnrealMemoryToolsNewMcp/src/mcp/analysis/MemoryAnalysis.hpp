@@ -25,6 +25,11 @@ MapSnapshot CaptureMaps(const KittyMemoryMgr &mgr);
 std::string CurrentMapRevision(const KittyMemoryMgr &mgr);
 bool IsReadableAddress(const MapSnapshot &snapshot, uintptr_t address, size_t size = 1);
 bool IsWritableAddress(const MapSnapshot &snapshot, uintptr_t address, size_t size = 1);
+// 「工具读得到」≠「内核 perms 有 r」。KittyMemSys 对 EFAULT 有 /proc/pid/mem pread 回退，
+// 国服 FNamePool / GUObjectArray 所在的 [anon:.bss] 窗口 perms 无 r（-w-p），readable=false
+// 却完全读得到。候选扫描的准入判断必须用这个；用 IsReadableAddress 会把真池整个排除，
+// 只在可读 BSS 里剩下假阳性。
+bool IsAccessibleAddress(const MapSnapshot &snapshot, uintptr_t address, size_t size = 1);
 ElfScanner FindUnrealElf(const KittyMemoryMgr &mgr, const std::string &moduleHint = {});
 
 json ListModules(const json &args, const KittyMemoryMgr &mgr);

@@ -8,6 +8,7 @@
 
 #include "UEMemory.hpp"
 #include "UEWrappers.hpp"
+#include "../Utils/TextSafe.hpp"
 
 using namespace UEMemory;
 
@@ -779,6 +780,9 @@ UEVarsInitStatus IGameProfile::InitUEVars()
     _UEVars.FrameCount = GetFrameCount();
     _UEVars.StaticFindObject = GetStaticFindObject();
     _UEVars.NativeAndroidApp = GetNativeAndroidApp();
+    // 在这里置位是因为本函数是 profile 内部的填值点，能访问 protected 的
+    // HasVerifiedNativeAndroidApp；产物的告警注释依赖它（见 UEOffsets::ToString）。
+    _UEVars.NativeAndroidAppVerified = HasVerifiedNativeAndroidApp();
     UEWrappers::Init(GetUEVars());
     _UEVars.ProcessEvent = GetProcessEvent();
 
@@ -840,6 +844,56 @@ uint8_t *IGameProfile::GetNameEntry(int32_t id) const
         return nullptr;
 
     return (chunck + chunck_offset);
+}
+
+bool IGameProfile::GetNameEntryMeta(int32_t id, size_t &outLength, int32_t &outNextId,
+                                    bool &outWide) const
+{
+    outLength = 0;
+    outNextId = -1;
+    outWide = false;
+
+    if (id < 0)
+        return false;
+
+    uint8_t *entry = GetNameEntry(id);
+    if (!entry)
+        return false;
+
+    if (!IsUsingFNamePool())
+    {
+        // 扁平 FNameEntryArray：id 稠密，长度交给 decode 侧判断，这里只负责往前走一格
+        outNextId = id + 1;
+        return true;
+    }
+
+    UE_Offsets *offsets = GetOffsets();
+    uint16_t header = 0;
+    if (!vm_rpm_ptr(entry + offsets->FNamePoolEntry.Header, &header, sizeof(int16_t)))
+        return false;
+
+    outLength = offsets->FNamePoolEntry.GetLength(header);
+    outWide = (header & 1) != 0;
+
+    // len 为 0 通常是 outline number 名字（正文不在本条目内），len 过大说明这个 id 根本
+    // 不在条目边界上——两种情况都不该继续沿着链往下走。
+    if (outLength == 0 || outLength > 1024)
+        return false;
+
+    const size_t stride = offsets->FNamePool.Stride ? offsets->FNamePool.Stride : 2;
+    // 分配器是 FNameEntryAllocator::Allocate，它把字节数向上对齐到 Stride 再切分，所以
+    // 条目占位是 align(2 + 正文, Stride) 而不是 2 + 正文。差这一下会在奇数长的名字上错位：
+    // "Color"(len 5) 真实占 8 字节、下一个 id 是 +4，按 2+5=7 算成 +3 就落到 id 35 的条目
+    // 中间，读出 "Q{" 之类的垃圾，之后整条链全歪。真机 block0 实测链
+    // 0,3,6,9,18,23,32,36,45,49,58,62,71,75,84,87,96,101,110,115,124 只有对齐版才对得上。
+    const size_t entryBytes = sizeof(int16_t) + (outWide ? outLength * 2 : outLength);
+    const size_t padded = (entryBytes + stride - 1) / stride * stride;
+    const int32_t step = static_cast<int32_t>(padded / stride);
+    if (step <= 0)
+        return false;
+
+    outNextId = id + step;
+    return true;
 }
 
 std::string IGameProfile::GetNameEntryString(uint8_t *entry) const
@@ -908,7 +962,12 @@ std::string IGameProfile::GetNameEntryString(uint8_t *entry) const
 
 std::string IGameProfile::GetNameByID(int32_t id) const
 {
-    return GetNameEntryString(GetNameEntry(id));
+    // GetNameEntryString 是唯一的上游，GetNameByID 是唯一的下游出口，因此这里是给名字
+    // 做编码校验的正确位置：必须晚于 dec_ansi 解密（改字节会改变 len，进而算错 key），
+    // 又早于任何消费者（SDK 生成、json 序列化、GUI、类名比较）。
+    // 越界或指向非名字的 id（例如 id=0）会解出任意字节，不校验就会在 response.dump()
+    // 处抛 type_error.316 把整个进程带走。
+    return UmtText::SanitizeUtf8(GetNameEntryString(GetNameEntry(id)));
 }
 
 ElfScanner IGameProfile::GetUnrealELF() const
@@ -1051,6 +1110,14 @@ uintptr_t IGameProfile::GetGUObjectArrayPtr() const
         return 0;
 
     const uintptr_t objObjectsOff = off->FUObjectArray.ObjObjects;
+    // FChunkedFixedUObjectArray::Objects is *inside* the ObjObjects sub-struct, not
+    // at ObjObjects itself, so the two offsets compose. Stock UE4 keeps
+    // TUObjectArray.Objects == 0 and the distinction is invisible, but a profile
+    // that carries a shifted layout (DeltaForce CN: NumElements 0x4, Objects 0x10)
+    // makes the difference fatal: reading ObjObjects alone lands on
+    // ObjFirstGCIndex|ObjLastNonGCIndex, which is never a readable pointer, so
+    // every candidate failed verification and the whole scan could not succeed.
+    const uintptr_t tuObjectsOff = off->TUObjectArray.Objects;
     const uintptr_t namePrivateOff = off->UObject.NamePrivate;
     const uintptr_t numChunks = off->TUObjectArray.NumElementsPerChunk;
     const uintptr_t itemObj = off->FUObjectItem.Object;
@@ -1066,7 +1133,7 @@ uintptr_t IGameProfile::GetGUObjectArrayPtr() const
 
     auto verifyCandidate = [&](uintptr_t candObjAddr, const char* direction) -> uintptr_t
     {
-        uintptr_t objects = vm_rpm_ptr<uintptr_t>((void *)(candObjAddr + objObjectsOff));
+        uintptr_t objects = vm_rpm_ptr<uintptr_t>((void *)(candObjAddr + objObjectsOff + tuObjectsOff));
         if (objects < 0x10000 || !kPtrValidator.isPtrReadable(objects, sizeof(uintptr_t)))
             return 0;
 

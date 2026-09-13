@@ -17,6 +17,15 @@ using namespace UEMemory;
 #define kOUT_NS_MEMBER_I(n, m) oss << "\n    constexpr int32_t " #m << " = " << n.m << ";"
 #define kOUT_NS_MEMBER_P(n, m) oss << "\n    constexpr uintptr_t " #m << " = " << (void *)(uintptr_t(n.m)) << ";"
 
+// 未校验指针的警示注释。数值本身保留（无 profile 的游戏只有兜底这一条路），
+// 但必须让读产物的人一眼看出这不是 profile 验证过的模块偏移。
+// 理由由调用方给出 —— 不同全局的兜底机制不一样，写死一种说法会误导。
+#define kOUT_PTR_UNVERIFIED(m, why) oss << "  // <== 未经 profile 校验：" why \
+    "；进大厅/对战后重跑 probe+dump 才可能得到 profile 校验过的偏移。"
+
+#define kOUT_PTR_UNVERIFIED_CLASSSCAN(m) kOUT_PTR_UNVERIFIED(m, \
+    "由「指向 " #m " 实例的任意模块槽位」兜底搜到，可能是瞬时实例而非全局变量")
+
 std::string UE_Offsets::ToString() const
 {
     std::ostringstream oss;
@@ -339,12 +348,21 @@ std::string UE_Pointers::ToString() const
         kOUT_NS_MEMBER_P((*this), UObjectArray);
         kOUT_NS_MEMBER_P((*this), ObjObjects);
         kOUT_NS_MEMBER_P((*this), Engine);
+        // 未通过 profile 校验的 Engine/World 必须显式标注，不能像别的常量一样平铺输出：
+        // 它们由「任意指向该类实例的模块槽位」兜底搜到，UWorld/UEngine 有多个实例
+        // （DFM 没进大厅时就有个名字为 Login 的菜单世界），所以可能是个瞬时实例而不是
+        // 全局变量。游戏没有专用 profile 时兜底是唯一手段，故保留数值、只加警示。
+        if (!EngineVerified) kOUT_PTR_UNVERIFIED_CLASSSCAN("Engine");
         kOUT_NS_MEMBER_P((*this), World);
+        if (!WorldVerified) kOUT_PTR_UNVERIFIED_CLASSSCAN("World");
         kOUT_NS_MEMBER_P((*this), Matrix);
         kOUT_NS_MEMBER_P((*this), Physx);
         kOUT_NS_MEMBER_P((*this), FrameCount);
         kOUT_NS_MEMBER_P((*this), StaticFindObject);
         kOUT_NS_MEMBER_P((*this), NativeAndroidApp);
+        if (!NativeAndroidAppVerified) kOUT_PTR_UNVERIFIED("NativeAndroidApp",
+            "基类实现是结构搜索（在可读段里找「指针 -> +0x20 -> +0x8 == \"zhCN\"」的槽位），"
+            "依赖运行时 locale 状态，可能为 0 或命中同形的别的槽位");
         kOUT_NS_MEMBER_P((*this), ProcessEvent);
         kOUT_NS_MEMBER_P((*this), ProcessEventIdx);
 

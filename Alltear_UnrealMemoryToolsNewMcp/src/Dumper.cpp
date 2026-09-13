@@ -10,6 +10,7 @@ using namespace UEMemory;
 
 #include "UPackageGenerator.hpp"
 #include "AutoFix/AutoFixOffsets.hpp"
+#include "Utils/TextSafe.hpp"
 
 namespace dumper_jf_ns
 {
@@ -210,7 +211,7 @@ bool UEDumper::Dump(std::unordered_map<std::string, BufferFmt> *outBuffersMap)
         js["Functions"].push_back(jf);
     }
 
-    scriptBufferFmt.append("{}", js.dump(4));
+    scriptBufferFmt.append("{}", UmtText::SafeDump(js, 4));
 
     return true;
 }
@@ -288,9 +289,26 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     uintptr_t ProcessEventIdx = FindProcessEventIdx(ProcessEvent);
     // Find UEngine & UWorld
     uintptr_t UEnginePtr = 0, UWorldPtr = 0;
+    // 只有 profile 的模块相对偏移算「已校验」，理由见下面赋值处与 UEOffsets 的输出标注。
+    bool engineFromProfile = false, worldFromProfile = false;
     if (((UE_UObject)UEWrappers::GetObjects()->GetObjectPtr(1)).GetIndex() == 1)
     {
         auto ueSegs = _profile->GetUnrealELF().segments();
+
+        // A profile that knows the module-relative slot for these globals is
+        // authoritative: the generic scan below only proves that *some* module slot
+        // points at *some* instance of the class, and a class like UWorld has many
+        // live instances, so it cannot distinguish the global from a transient one.
+        UWorldPtr = _profile->GetGWorldSlot();
+        UEnginePtr = _profile->GetGEngineSlot();
+
+        // 只有 profile 的模块相对偏移算「已校验」。下面那段兜底枚举用的是「任意一个
+        // 指向该类的模块槽位」，而 UWorld/UEngine 同时存在多个实例（DFM 没进大厅时
+        // 就有一个名字为 Login 的菜单世界），它无法区分全局与瞬时实例 —— 注释里早就
+        // 写明了这一点，但产物里没有任何标记，于是「World 偏移看着像、拿去用却不对」。
+        // 这里如实记录来源，由 UEOffsets 输出时标注。
+        worldFromProfile = UWorldPtr != 0;
+        engineFromProfile = UEnginePtr != 0;
 
         UE_UClass UEngineClass = UEWrappers::GetObjects()->FindObject("Class Engine.Engine").Cast<UE_UClass>();
         UE_UClass UWorldClass = UEWrappers::GetObjects()->FindObject("Class Engine.World").Cast<UE_UClass>();
@@ -298,8 +316,10 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
         logsBufferFmt.append("Finding GEngine & GWorld...\n");
         logsBufferFmt.append("{} -> 0x{:X}\n", UEngineClass.GetFullName(), uintptr_t(UEngineClass.GetAddress()));
         logsBufferFmt.append("{} -> 0x{:X}\n", UWorldClass.GetFullName(), uintptr_t(UWorldClass.GetAddress()));
+        if (UWorldPtr) logsBufferFmt.append("GWorld slot from profile: [<Base> + 0x{:X}]\n", UWorldPtr - baseAddr);
+        if (UEnginePtr) logsBufferFmt.append("GEngine slot from profile: [<Base> + 0x{:X}]\n", UEnginePtr - baseAddr);
 
-        if (UEngineClass || UWorldClass)
+        if ((!UWorldPtr || !UEnginePtr) && (UEngineClass || UWorldClass))
         {
             UEWrappers::GetObjects()->ForEachObject([&ueSegs, &UEngineClass, &UWorldClass, &UEnginePtr, &UWorldPtr](UE_UObject object)
             {
@@ -312,7 +332,10 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
                     // reverse search, start with .bss
                     for (auto it = ueSegs.rbegin(); it != ueSegs.rend(); ++it)
                     {
-                        if (!it->is_rw) continue;
+                        // `writeable` is (perms[1]=='w'), so it also covers the "-w-p"
+                        // [anon:.bss] window the globals live in; `is_rw` is a strict
+                        // "rw-" match and skipped exactly that one segment.
+                        if (!it->writeable) continue;
 
                         uintptr_t ptr = FindAlignedPointerRefrence(it->startAddress, it->length, object.GetAddress());
                         if (ptr != 0)
@@ -330,15 +353,22 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
             });
         }
 
-        if (!UEnginePtr)
-            logsBufferFmt.append("Couldn't find refrence to GEngine.\n");
-        else
-            logsBufferFmt.append("GEngine: [<Base> + 0x{:X}] = 0x{:X}\n", UEnginePtr - baseAddr, UEnginePtr);
-
-        if (!UWorldPtr)
-            logsBufferFmt.append("Couldn't find refrence to GWorld.\n");
-        else
-            logsBufferFmt.append("GWorld: [<Base> + 0x{:X}] = 0x{:X}\n", UWorldPtr - baseAddr, UWorldPtr);
+        // UEnginePtr/UWorldPtr are *slots* (the address of the global pointer
+        // variable), so the offset is what matters; deref to show the object.
+        auto reportSlot = [&](const char *name, uintptr_t slot, bool verified)
+        {
+            if (!slot)
+            {
+                logsBufferFmt.append("Couldn't find refrence to {}.\n", name);
+                return;
+            }
+            const uintptr_t object = vm_rpm_ptr<uintptr_t>((void *)slot);
+            logsBufferFmt.append("{}: [<Base> + 0x{:X}] = 0x{:X} -> 0x{:X}{}\n",
+                                 name, slot - baseAddr, slot, object,
+                                 verified ? "" : "   <== 未经 profile 校验（兜底搜索），可能是瞬时实例");
+        };
+        reportSlot("GEngine", UEnginePtr, engineFromProfile);
+        reportSlot("GWorld", UWorldPtr, worldFromProfile);
 
         logsBufferFmt.append("==========================\n");
     }
@@ -362,7 +392,10 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     if (!NativeAndroidApp)
         logsBufferFmt.append("Couldn't find refrence to NativeAndroidApp.\n");
     else
-        logsBufferFmt.append("NativeAndroidApp: [<Base> + 0x{:X}] = 0x{:X}\n", NativeAndroidApp - baseAddr, NativeAndroidApp);
+        logsBufferFmt.append("NativeAndroidApp: [<Base> + 0x{:X}] = 0x{:X}{}\n",
+            NativeAndroidApp - baseAddr, NativeAndroidApp,
+            _profile->GetUEVars()->IsNativeAndroidAppVerified() ? "" :
+            "   <== 结构搜索所得（非 profile 偏移），依赖 locale 状态");
     if (!ProcessEvent)
         logsBufferFmt.append("Couldn't find refrence to ProcessEvent.\n");
     else
@@ -378,6 +411,11 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     uEPointers.ObjObjects = objObjectsPtr - baseAddr;
     uEPointers.Engine = UEnginePtr ? (UEnginePtr - baseAddr) : 0;
     uEPointers.World = UWorldPtr ? (UWorldPtr - baseAddr) : 0;
+    uEPointers.EngineVerified = engineFromProfile;
+    uEPointers.WorldVerified = worldFromProfile;
+    // NativeAndroidApp 一直是结构搜索结果（没有任何 profile 声明它的 RVA），
+    // 由 profile 如实报告是否已校验。
+    uEPointers.NativeAndroidAppVerified = _profile->GetUEVars()->IsNativeAndroidAppVerified();
     uEPointers.Matrix = Matrix ? (Matrix - baseAddr) : 0;
     uEPointers.Physx = Physx ? (Physx - baseAddr) : 0;
     uEPointers.FrameCount = FrameCount ? (FrameCount - baseAddr) : 0;

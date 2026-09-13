@@ -80,6 +80,24 @@ public:
 
     virtual UE_Offsets *GetOffsets() const = 0;
 
+    // Address of the `UWorld*` / `UEngine*` global *pointer variable* (the slot),
+    // or 0 when this build cannot name it. A profile that has a verified
+    // module-relative offset for the slot should return `base + rva`; that is
+    // strictly more reliable than guessing which object instance is the global,
+    // because a class like UWorld has many live instances and the reference scan
+    // cannot tell the global apart from a transient one. Public because the
+    // dumper consumes these directly, unlike the other Get* helpers which feed
+    // UEVars.
+    virtual uintptr_t GetGWorldSlot() const { return 0; }
+    virtual uintptr_t GetGEngineSlot() const { return 0; }
+
+    // 名字池的 id 不是稠密的：FNamePool 里条目首尾相接（2 字节 header + len 字节正文，
+    // 不同版本还可能带 NUL/对齐填充），所以相邻两个真实 id 的间隔 = 条目字节数 / Stride。
+    // 按 id 自增枚举会落进条目中间，读出一个由后续若干条目拼起来的长串（中间夹着被
+    // 当成正文的 2 字节 header）。要枚举就必须按条目链走，这个接口给出走一步所需的信息。
+    // 返回 false 表示该 id 处无法解析条目（含扁平 FNameEntryArray 之外的异常情况）。
+    virtual bool GetNameEntryMeta(int32_t id, size_t &outLength, int32_t &outNextId, bool &outWide) const;
+
 protected:
     virtual uintptr_t GetGUObjectArrayPtr() const;
     virtual uintptr_t GetMatrix()  const = 0;
@@ -88,6 +106,12 @@ protected:
     virtual uintptr_t GetStaticFindObject() const;
     virtual uintptr_t GetNativeAndroidApp() const;
     virtual uintptr_t GetProcessEvent() const;
+    // NativeAndroidApp 的基类实现是「结构搜索」而非声明式模块偏移：它在可读段里找
+    // 「指针 → +0x20 → +0x8 == "zhCN"」的槽位，依赖运行时 locale 状态，因此可能为 0，
+    // 也可能命中同形的别的槽位。目前没有任何 profile 声明过它的 RVA，所以默认就是
+    // 「未校验」；将来若某个游戏把 RVA 写进 profile，覆盖本函数返回 true 即可让产物
+    // 不再带告警注释。
+    virtual bool HasVerifiedNativeAndroidApp() const { return false; }
     // GNames / NamePoolData
     virtual uintptr_t GetNamesPtr() const;
 

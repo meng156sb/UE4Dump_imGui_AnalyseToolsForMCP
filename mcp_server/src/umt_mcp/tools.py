@@ -515,10 +515,17 @@ def detect_ue_version() -> str:
 
 def sample_gnames(source: str | None = None, session_id: str | None = None,
                   candidate_id: int | None = None,
-                  start_index: int | None = None, count: int | None = None) -> str:
-    """从 ProbeResult 或候选 session 抽样 FNamePool 条目。"""
+                  start_index: int | None = None, count: int | None = None,
+                  walk: bool | None = None, decode: str | None = None) -> str:
+    """从 ProbeResult 或候选 session 抽样 FNamePool 条目。
+
+    decode: auto（默认）/ dfm（强制解）/ none（当明文）。宽字符 CJK 在 DFM 上
+    必须用 dfm——auto 对 L=2 的「地图」会留下密文（密文本身也是合法 CJK）。
+    walk 默认 true（沿条目链）；false 按 id 自增，用来对照 id 是否稠密。
+    """
     return _dev("sample_gnames", source=source, sessionId=session_id,
-                candidateId=candidate_id, startIndex=start_index, count=count)
+                candidateId=candidate_id, startIndex=start_index, count=count,
+                walk=walk, decode=decode)
 
 
 def scan_gnames(source: str | None = None, region: str | None = None,
@@ -531,14 +538,18 @@ def scan_gnames(source: str | None = None, region: str | None = None,
                 max_scan_bytes: int | None = None,
                 cursor: str | None = None, limit: int | None = None,
                 session_id: str | None = None,
-                async_mode: bool | None = None) -> str:
-    """attach-only 扫描并评分 FNamePool 候选；Probe 成功时 AUTO 可直接回权威结果。"""
+                async_mode: bool | None = None,
+                decode: str | None = None) -> str:
+    """attach-only 扫描并评分 FNamePool 候选；Probe 成功时 AUTO 可直接回权威结果。
+
+    decode: auto / dfm / none。DFM 宽字符 CJK 用 dfm。
+    """
     return _dev("scan_gnames", source=source, region=region, mapIds=map_ids,
                 minPtr=min_ptr, maxPtr=max_ptr,
                 anchorNames=anchor_names, anchorOffsets=anchor_offsets,
                 layouts=layouts, maxCandidates=max_candidates,
                 maxScanBytes=max_scan_bytes, cursor=cursor, limit=limit,
-                sessionId=session_id, **{"async": async_mode})
+                sessionId=session_id, decode=decode, **{"async": async_mode})
 
 
 def sample_objects(source: str | None = None, session_id: str | None = None,
@@ -559,14 +570,15 @@ def scan_objects(source: str | None = None,
                  max_candidates: int | None = None,
                  cursor: str | None = None, limit: int | None = None,
                  session_id: str | None = None,
-                 async_mode: bool | None = None) -> str:
+                 async_mode: bool | None = None,
+                 decode: str | None = None) -> str:
     """attach-only 结构预筛并评分 flat/chunked GUObjectArray 候选。"""
     return _dev("scan_objects", source=source, namesSessionId=names_session_id,
                 namesCandidateId=names_candidate_id, region=region, mapIds=map_ids,
                 direction=direction, origin=origin,
                 maxDistanceBytes=max_distance_bytes, layouts=layouts,
                 maxCandidates=max_candidates, cursor=cursor, limit=limit,
-                sessionId=session_id, **{"async": async_mode})
+                sessionId=session_id, decode=decode, **{"async": async_mode})
 
 
 def search_classes(query: str, max_results: int | None = None) -> str:
@@ -769,11 +781,14 @@ DEVICE_PARAMS: dict[str, frozenset[str]] = {
     "ALLOC_SCRATCH": frozenset({"size"}),
     "SCAN_GNAMES": frozenset({"source", "region", "mapIds", "minPtr", "maxPtr",
                                "anchorNames", "anchorOffsets", "layouts", "maxCandidates",
-                               "maxScanBytes", "cursor", "limit", "sessionId", "async"}),
-    "SAMPLE_GNAMES": frozenset({"source", "sessionId", "candidateId", "startIndex", "count"}),
+                               "maxScanBytes", "cursor", "limit", "sessionId", "async",
+                               "decode"}),
+    "SAMPLE_GNAMES": frozenset({"source", "sessionId", "candidateId", "startIndex", "count",
+                                "walk", "decode"}),
     "SCAN_OBJECTS": frozenset({"source", "namesSessionId", "namesCandidateId", "region",
                                 "mapIds", "direction", "origin", "maxDistanceBytes",
-                                "layouts", "maxCandidates", "cursor", "limit", "sessionId", "async"}),
+                                "layouts", "maxCandidates", "cursor", "limit", "sessionId", "async",
+                                "decode"}),
     "SAMPLE_OBJECTS": frozenset({"source", "sessionId", "candidateId", "startIndex", "count"}),
     "SEARCH_CLASSES": frozenset({"nameFilter", "maxResults", "caseSensitive"}),
     "DESCRIBE_CLASS": frozenset({"address", "name"}),
