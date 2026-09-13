@@ -397,53 +397,78 @@ namespace
 
     bool HasUnrealLib(pid_t pid)
     {
-        auto maps = KittyMemoryEx::getAllMaps(pid);
-        for (const auto &m : maps)
+        // 不要用 KittyMemoryEx::getAllMaps()：它把整个 /proc/<pid>/maps 解析成
+        // vector<ProcMap>，每行一次 sscanf、外加一个 std::string 分配。本机 DFM 单个
+        // 进程就有 5851 行，而启动时要把 /proc 下每个进程都问一遍 —— 几百个进程累起来
+        // 就是启动那一下卡顿的绝大部分。这里流式逐行找、命中即返回，不构造任何容器。
+        char path[64] = {0};
+        snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+        FILE *fp = fopen(path, "r");
+        if (!fp) return false;
+
+        char line[512] = {0};
+        bool found = false;
+        while (fgets(line, sizeof(line), fp))
         {
-            if (m.pathname.find("libUE4.so") != std::string::npos ||
-                m.pathname.find("libUnreal.so") != std::string::npos)
-                return true;
+            if (strstr(line, "libUE4.so") || strstr(line, "libUnreal.so"))
+            {
+                found = true;
+                break;
+            }
         }
-        return false;
+        fclose(fp);
+        return found;
     }
 
     std::vector<AutoProcessCandidate> FindAutoProcessCandidates()
     {
-        std::unordered_map<std::string, AutoProcessCandidate> candidates;
+        // 一次 /proc 快照，供两段共用。
+        // 改前：第一段对每个 AppID 都调一次 KittyMemoryEx::getPIDsOf()，而它是「打开 /proc、
+        // 对每个 pid 读一次 cmdline」的全量扫描 —— 十几个 AppID 就是十几遍全扫；第二段又把
+        // 每个 pid 的 cmdline 再读一遍。设备上 /proc 有上千条目（内核线程占大半），重复读
+        // 是启动卡顿的主因。现在只读一遍，两段都查这张表。
+        std::vector<std::pair<pid_t, std::string>> snapshot;
+        std::unordered_map<std::string, pid_t> nameToPid;
+        if (DIR *dir = opendir("/proc"))
+        {
+            dirent *entry = nullptr;
+            while ((entry = readdir(dir)) != nullptr)
+            {
+                if (!IsNumericName(entry->d_name))
+                    continue;
+                const pid_t pid = static_cast<pid_t>(atoi(entry->d_name));
+                if (pid <= 0)
+                    continue;
+                std::string name = KittyMemoryEx::getProcessName(pid);
+                if (name.empty())
+                    continue;   // 内核线程 / 无权读取 / 已退出
+                // 同名多进程时后者覆盖前者，与原先 getPIDsOf() 取「最后一个命中」一致。
+                nameToPid[name] = pid;
+                snapshot.emplace_back(pid, std::move(name));
+            }
+            closedir(dir);
+        }
 
+        std::unordered_map<std::string, AutoProcessCandidate> candidates;
         for (auto *profile : UE_Games)
         {
             for (const auto &pkg : profile->GetAppIDs())
             {
-                auto pids = KittyMemoryEx::getPIDsOf(pkg);
-                for (pid_t pid : pids)
-                    candidates[pkg] = {pid, pkg, profile->GetAppName(), true};
+                auto it = nameToPid.find(pkg);
+                if (it != nameToPid.end())
+                    candidates[pkg] = {it->second, pkg, profile->GetAppName(), true};
             }
         }
 
-        DIR *dir = opendir("/proc");
-        if (!dir) return {};
-
-        dirent *entry = nullptr;
-        while ((entry = readdir(dir)) != nullptr)
+        for (const auto &entry : snapshot)
         {
-            if (!IsNumericName(entry->d_name))
+            if (candidates.count(entry.second) > 0)
+                continue;
+            if (!HasUnrealLib(entry.first))
                 continue;
 
-            pid_t pid = static_cast<pid_t>(atoi(entry->d_name));
-            if (pid <= 0)
-                continue;
-
-            std::string processName = KittyMemoryEx::getProcessName(pid);
-            if (processName.empty() || candidates.count(processName) > 0)
-                continue;
-            if (!HasUnrealLib(pid))
-                continue;
-
-            candidates[processName] = {pid, processName, "自动识别 (UE4/UE5 通用)", false};
+            candidates[entry.second] = {entry.first, entry.second, "自动识别 (UE4/UE5 通用)", false};
         }
-
-        closedir(dir);
 
         std::vector<AutoProcessCandidate> result;
         result.reserve(candidates.size());
